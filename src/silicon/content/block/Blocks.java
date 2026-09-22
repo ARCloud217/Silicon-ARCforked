@@ -151,7 +151,8 @@ public class Blocks {
             health = 320;
         }};
         // 润滑油注入器：2x2 支援方块，耗润滑油使紧贴的己方炮塔攻速 +20%（与强化液加法叠加，攻击时按炮塔数消耗 5/s）、
-        // 存油期间转角速率 +50%
+        // 存油期间转角速率 ×2（+100%，自动索敌与玩家控制同等生效）；规则名单（boostTargets）默认仅放行炮塔，
+        // 应用强化前一律先查队伍+名单，非炮塔方块不会被套用炮塔专用逻辑
         lubricantInjector = new LubricantInjector("lubricant-injector") {{
             requirements(Category.turret, BuildVisibility.shown,
                     ItemStack.with(Items.copper, 120, Items.lead, 80, Items.silicon, 40));
