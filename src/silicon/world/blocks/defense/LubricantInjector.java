@@ -1,33 +1,45 @@
 package silicon.world.blocks.defense;
 
+import arc.math.Angles;
+import arc.util.Time;
 import mindustry.gen.Building;
 import mindustry.type.Liquid;
 import mindustry.world.Block;
+import mindustry.world.blocks.defense.turrets.BaseTurret;
 import mindustry.world.blocks.defense.turrets.Turret;
 
 import static silicon.content.liquid.Liquids.lubricant;
 
 /**
- * 润滑油注入器：2x2 支援方块，消耗润滑油为「紧贴」的己方炮塔提供射速加成。
+ * 润滑油注入器：2x2 支援方块，消耗润滑油强化「紧贴」的己方炮塔。
  *
- * <p>效果：注入器按受惠炮塔数量 × consumePerTurret 持续消耗润滑油（默认 5/s 每个）；
- * 润滑油不足时全部炮塔不享受加成（耗量与效果强绑定，不赊账）。
+ * <p>攻速强化（v159.7 换弹模型）：炮塔充能由 {@code ReloadTurretBuild.reloadCounter} 每 tick 累加
+ * {@code updateReload() = delta()×ammoReloadMultiplier()×efficiency}，达到 {@code Turret.reload}
+ * 阈值即开火并取模清零；强化液则会在 updateCooling() 里往同一个计数器追加
+ * {@code 冷却量×edelta()×heatCapacity×coolantMultiplier×ammoReloadMultiplier}。
+ * 本方块照强化液的方式把 {@code fireBoost}（0.2 = 参考基准下 +20% 射速）以
+ * {@code fireBoost×edelta()×ammoReloadMultiplier} 注入同一加法池：
+ * <ul>
+ *   <li>与强化液呈加法叠加（固定充能点数入池，不随效率/超速倍率放大），不会互相稀释出乘法偏离；</li>
+ *   <li>仅当炮塔进入攻击状态（isShooting）才消耗润滑油（默认 5/s 每个正在攻击的炮塔），
+ *       无炮塔攻击或润滑油耗尽时零消耗零加成。</li>
+ * </ul>
  *
- * <p>射速加成实现（v159.7 换弹模型）：炮塔充能节奏由
- * {@code ReloadTurretBuild.reloadCounter} 每 tick 经 updateReload() 累加
- * {@code delta() × ammoReloadMultiplier() × baseReloadSpeed()（=efficiency）}，达到
- * {@code Turret.reload} 阈值即开火并取模清零。本方块每 tick 再对相邻炮塔注入同构公式的
- * ({@code boostMultiplier} - 1)（默认 0.5）倍，净充能即 boostMultiplier 倍 -> 射速精确 150%。
- * {@code reloadCounter}、{@code efficiency} 为 public 字段，{@code delta()}/{@code hasAmmo()}/
- * {@code peekAmmo()} 为公开方法；注入为纯加法，与炮塔自身 update 执行顺序无关，无竞态。
+ * <p>转角强化（v159.7 旋转模型）：引擎转身为
+ * {@code rotation = Angles.moveToward(rotation, 目标角, rotateSpeed×delta()×potentialEfficiency)}，
+ * 成员均公开。只要注入器内存有润滑油，就对所有紧贴的己方炮塔再进一格
+ * ({@code rotationBoost})×同式，等效转角速率 {@code +50%}（绕过 rotateSpeed 上限、随超速乘法叠加、
+ * 与射速无关；无目标/锁定转身时不干扰）。该强化只要求「有润滑液」，不额外耗油。
  *
  * <p>门禁（与原版语义一致）：只对同队炮塔生效（含 derelict 判定），润滑油输入也只接受同队供给。
  */
 public class LubricantInjector extends Block {
 
-    /** 射速倍率：1.5 = 攻击速度提升至 150% */
-    public float boostMultiplier = 1.5f;
-    /** 每个受惠炮塔的润滑油消耗（单位/秒） */
+    /** 攻速加成：每 tick 注入的固定充能点数（参考基准 efficiency=timeScale=ammoRM=1 时即 +20% 射速） */
+    public float fireBoost = 0.2f;
+    /** 转角速率加成倍率：0.5 = 旋转速度 +50% */
+    public float rotationBoost = 0.5f;
+    /** 每个正在攻击的受惠炮塔的润滑油消耗（单位/秒） */
     public float consumePerTurret = 5f;
 
     public LubricantInjector(String name) {
@@ -45,32 +57,51 @@ public class LubricantInjector extends Block {
         public void update() {
             super.update();
 
-            // 统计紧邻的己方炮塔数量（proximity 已包含贴建的所有相邻建筑）
-            int turrets = 0;
-            for (Building b : proximity) {
-                if (b.team == team && b instanceof Turret.TurretBuild) {
-                    turrets++;
-                }
-            }
+            boolean hasLubricant = liquids.get(lubricant) > 0.001f;
 
-            // 润滑油不足时视为无加成，耗量与效果强绑定
-            if (turrets <= 0) {
-                return;
-            }
-            float held = liquids.get(lubricant);
-            if (held <= 0.001f) {
-                return;
-            }
-            float need = consumePerTurret * turrets * edelta();
-            liquids.remove(lubricant, Math.min(need, held));
-
-            // 逐炮塔注入与引擎同构的充能增量，使净充能速率变为 boostMultiplier 倍
-            float extra = boostMultiplier - 1f;
+            // —— 攻速强化：仅统计正在攻击的己方炮塔（isShooting），攻击才消耗 ——
+            int attacking = 0;
             for (Building b : proximity) {
                 if (b.team == team && b instanceof Turret.TurretBuild) {
                     Turret.TurretBuild t = (Turret.TurretBuild) b;
-                    float ammoRM = t.hasAmmo() ? t.peekAmmo().reloadMultiplier : 1f;
-                    t.reloadCounter += extra * t.delta() * ammoRM * t.efficiency;
+                    if (t.isShooting()) {
+                        attacking++;
+                    }
+                }
+            }
+
+// 有润滑油且有炮塔在攻击：按数量扣油（Time.delta≈1/60fps帧，除 60 折算为真实秒→5/s），
+            // 并向攻击中的炮塔按「强化液同池」注入固定充能点数
+            if (attacking > 0 && hasLubricant) {
+                float held = liquids.get(lubricant);
+                float need = consumePerTurret * attacking * Time.delta / 60f;
+                liquids.remove(lubricant, Math.min(need, held));
+
+                for (Building b : proximity) {
+                    if (b.team == team && b instanceof Turret.TurretBuild) {
+                        Turret.TurretBuild t = (Turret.TurretBuild) b;
+                        if (t.isShooting()) {
+                            float ammoRM = t.hasAmmo() ? t.peekAmmo().reloadMultiplier : 1f;
+                            t.reloadCounter += fireBoost * t.edelta() * ammoRM;
+                        }
+                    }
+                }
+            }
+
+            // —— 转角强化：只要注入器内有润滑液，全部紧贴的己方炮塔旋转速度 +50%（无需攻击、不额外耗油）——
+            if (hasLubricant) {
+                for (Building b : proximity) {
+                    if (b.team == team && b instanceof Turret.TurretBuild) {
+                        Turret.TurretBuild t = (Turret.TurretBuild) b;
+if (t.target != null && t.shouldTurn()) {
+                            // 与引擎 turnToTarget 完全一致：先刷新弹道预测瞄准点 targetPos，再取 angleTo(targetPos)，
+                            // 否则注入目标(当前位置)与引擎目标(预测位置)打架抵消旋转加速
+                            t.targetPosition(t.target);
+                            float des = t.angleTo(t.targetPos);
+                            t.rotation = Angles.moveToward(t.rotation, des,
+                                    rotationBoost * ((BaseTurret) t.block).rotateSpeed * t.delta() * t.potentialEfficiency);
+                        }
+                    }
                 }
             }
         }

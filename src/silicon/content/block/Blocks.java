@@ -150,9 +150,10 @@ public class Blocks {
             size = 2;
             health = 320;
         }};
-        // 润滑油注入器：2x2 支援方块，耗润滑油将紧贴的己方炮塔射速提升至 150%（每加成一个炮塔多耗 5/s）
+        // 润滑油注入器：2x2 支援方块，耗润滑油使紧贴的己方炮塔攻速 +20%（与强化液加法叠加，攻击时按炮塔数消耗 5/s）、
+        // 存油期间转角速率 +50%
         lubricantInjector = new LubricantInjector("lubricant-injector") {{
-            requirements(Category.defense, BuildVisibility.shown,
+            requirements(Category.turret, BuildVisibility.shown,
                     ItemStack.with(Items.copper, 120, Items.lead, 80, Items.silicon, 40));
             alwaysUnlocked = true;
             size = 2;
