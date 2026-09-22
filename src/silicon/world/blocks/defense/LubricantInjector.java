@@ -27,8 +27,8 @@ import static silicon.content.liquid.Liquids.lubricant;
  *
  * <p>转角强化（v159.7 旋转模型）：引擎转身为
  * {@code rotation = Angles.moveToward(rotation, 目标角, rotateSpeed×delta()×potentialEfficiency)}，
- * 成员均公开。只要注入器内存有润滑油，就对所有紧贴的己方炮塔再进一格
- * ({@code rotationBoost})×同式，等效转角速率 {@code +50%}（绕过 rotateSpeed 上限、随超速乘法叠加、
+* 成员均公开。只要注入器内存有润滑油，就对所有紧贴的己方炮塔再进一格
+ * ({@code rotationBoost})×同式，等效转角速率提升至 {@code ×3}（绕过 rotateSpeed 上限、随超速乘法叠加、
  * 与射速无关；无目标/锁定转身时不干扰）。该强化只要求「有润滑液」，不额外耗油。
  *
  * <p>门禁（与原版语义一致）：只对同队炮塔生效（含 derelict 判定），润滑油输入也只接受同队供给。
@@ -37,8 +37,8 @@ public class LubricantInjector extends Block {
 
     /** 攻速加成：每 tick 注入的固定充能点数（参考基准 efficiency=timeScale=ammoRM=1 时即 +20% 射速） */
     public float fireBoost = 0.2f;
-    /** 转角速率加成倍率：0.5 = 旋转速度 +50% */
-    public float rotationBoost = 0.5f;
+/** 转角速率加成倍率：2.0 = 旋转速度 ×3（+200%） */
+    public float rotationBoost = 2.0f;
     /** 每个正在攻击的受惠炮塔的润滑油消耗（单位/秒） */
     public float consumePerTurret = 5f;
 
