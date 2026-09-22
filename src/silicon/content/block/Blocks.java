@@ -7,6 +7,7 @@ import mindustry.type.ItemStack;
 import mindustry.world.Block;
 import mindustry.world.meta.BuildVisibility;
 import silicon.world.blocks.container.DualPurposeStorager;
+import silicon.world.blocks.defense.LubricantInjector;
 import silicon.world.blocks.defense.Switch;
 import silicon.world.blocks.distribution.ItemTransferHub;
 import silicon.world.blocks.distribution.Junction;
@@ -27,7 +28,8 @@ import static mindustry.type.ItemStack.with;
 public class Blocks {
     public static Block powerGeneratorPump, dualPurposeJunction, dualPurposeStorager,
             rollGenerator, powerProtector, powerSource, mineConverter, theSwitch, itemTransferHub,
-            dimensionAnchor, signalSource, universalJunction, signalRelay, messageTest, petroleumRefinery;
+            dimensionAnchor, signalSource, universalJunction, signalRelay, messageTest, petroleumRefinery,
+            lubricantInjector;
 
     public static void load() {
         powerGeneratorPump = new GeneratorPump("power-generator-pump") {{
@@ -147,6 +149,14 @@ public class Blocks {
             alwaysUnlocked = true;
             size = 2;
             health = 320;
+        }};
+        // 润滑油注入器：2x2 支援方块，耗润滑油将紧贴的己方炮塔射速提升至 150%（每加成一个炮塔多耗 5/s）
+        lubricantInjector = new LubricantInjector("lubricant-injector") {{
+            requirements(Category.defense, BuildVisibility.shown,
+                    ItemStack.with(Items.copper, 120, Items.lead, 80, Items.silicon, 40));
+            alwaysUnlocked = true;
+            size = 2;
+            health = 220;
         }};
     }
 }
