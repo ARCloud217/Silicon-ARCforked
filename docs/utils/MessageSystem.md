@@ -54,7 +54,7 @@ MessageSystem.instance
 
 | 分组 | 字段 | 当前用途 |
 |------|------|----------|
-| 身份/路由 | `type`、`priority`、`team`、`global`、`uid`、`senderKey` | 生命周期、排序、队伍可见性和跨进程寻址 |
+| 身份/路由 | `type`、`priority`、`team`、`global`、`local`、`uid`、`senderKey` | 生命周期、排序、队伍可见性、**仅本地标记**和跨进程寻址 |
 | 文本 | `title`、`content`、`titleKey`、`contentKey`、`vars` | 标题、正文、本地化键和 `{0}` 等占位符 |
 | 样式 | `titleColor`、`contentColor`、`titleScale`、`contentScale`、`icon`、`background`、`bubbleColor`、`overlayColor` | 气泡、标题、正文、图标和时限覆盖层绘制 |
 | 生命周期 | `ttl`、`handshake`、`contentProvider` | 瞬时消息倒计时、持续型握手和实时内容 |
@@ -75,6 +75,7 @@ MessageSystem.instance
 | 瞬时消息时限 | `ttl = -1`，表示不启用本地倒计时 |
 | 跨进程 uid | `-1`；权威进程 `add` 时分配 |
 | 消息队伍 | `null`；按通用消息处理 |
+| 仅本地标记 | `local = false`；为 `true` 时不参与联网广播，只出现在投递者自己的面板 |
 
 构造函数会将字符串字面量中的 `\\n` 转换成实际换行符，便于调试面板和文本输入使用。
 
@@ -129,6 +130,22 @@ MessageSystem.instance
 | 其他情况 | 不可见 |
 
 联网时，服务器在 `MessageSync.push` 中先按玩家队伍过滤；客户端面板仍会再次过滤，主要用于单机、房主本地数据和异常镜像的保护。
+
+### 3.3 仅本地消息（`local`）
+
+`local == true` 的消息**不参与任何联网广播**，只出现在投递者自己的面板上，其他在线玩家（含敌队）收不到。
+与 `team`/`global` 的可见性过滤是**两个不同层次**：
+
+| 层次 | 作用 | 实现 |
+|------|------|------|
+| `local` | **是否广播** | `MessageSync.messageAdded` / `broadcastLiveUpdates` 遇 `local` 直接返回，不发包 |
+| `team` / `global` | 广播后**谁能看到** | `Message.visibleTo(viewer)` + `push` 的队伍过滤 |
+
+必要性：未设 `team` 的消息 `visibleTo` 对所有队伍都为 `true`。若房主（host）投递这样一条消息，
+`push` 会把它发给**全部**在线玩家——把「玩家本地查看详情」变成全服通知，既是信息泄露也是刷屏。
+个人本地查看类消息（典型：点击世界中的标记查看该建筑的详情）应标记 `local`。
+
+标记 `local` 的消息仍在本地面板正常显示，并按 `ttl` 到期消失。
 
 ## 4. 生命周期
 
@@ -228,7 +245,8 @@ WorldLoadEvent
 工厂的带 `life` 重载会在模板基础上设置时限。常用链式配置包括：
 
 ```java
-MessageSystem.post(
+// 注意：post 是实例方法，需经 MessageSystem.instance 调用
+MessageSystem.instance.post(
     MessageSystem.warning(title, content)
         .titleKey("example.warning.title")
         .contentKey("example.warning.content")
@@ -236,6 +254,13 @@ MessageSystem.post(
         .global(false)
         .icon(Icon.warning)
         .life(5f)
+);
+
+// 玩家本地查看详情：标记 local，仅投递者自己可见、不广播
+MessageSystem.instance.post(
+    MessageSystem.info(title, content)
+        .local()
+        .life(10f)
 );
 ```
 
@@ -260,11 +285,12 @@ MessageSystem.post(
 |------|----------|------|
 | 新增瞬时消息 | 是 | `OP_ADD`，按队伍/全局可见性发送 |
 | 新增持续型消息 | 是 | `OP_ADD`，后续还可能收到 `OP_UPDATE` |
+| 新增 `local` 消息 | **否** | 仅本地，`messageAdded` 直接返回，不发包（见 3.3） |
 | 瞬时消息移除 | 否 | 各玩家自己的已读 TTL、上限和清空互不影响 |
 | 持续型消息移除 | 是 | `OP_REMOVE` |
 | 持续型消息剔除 | 是 | `OP_TRIM`，正常情况下持续型不参与上限剔除 |
 | 全部清空 | 当前不广播 | 各进程自行在 `WorldLoadEvent` 清空 |
-| 持续型内容变化 | 是 | `OP_UPDATE`，默认最短间隔 0.5 秒 |
+| 持续型内容变化 | 是 | `OP_UPDATE`，默认最短间隔 0.5 秒；`local` 消息跳过 |
 
 服务器会跳过房主自己的本地连接，房主已经通过本地 `MessageSystem.add` 登记，避免回环导致重复插入。`MessageSystem.applyNetAdd` 还会按 uid 做幂等检查。
 

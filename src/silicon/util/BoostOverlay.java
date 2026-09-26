@@ -6,6 +6,7 @@ import arc.graphics.Color;
 import arc.graphics.g2d.Draw;
 import arc.graphics.g2d.TextureRegion;
 import arc.input.KeyCode;
+import arc.math.Mathf;
 import arc.math.geom.Rect;
 import arc.scene.style.Drawable;
 import arc.scene.style.TextureRegionDrawable;
@@ -22,8 +23,10 @@ import mindustry.graphics.Pal;
  * 点击后把该目标的强化详情投递到消息面板（{@link MessageSystem}），10 秒后自动消失。
  *
  * <p><b>按钮</b>：固定 0.5 格（4×4px）大小，锚在 footprint 左下角那一格的<b>内侧</b>（紧贴角、不越出方块）。
- * 外观为游戏风格：半透明强调色底板 + 原版图标 + 亮色描边，鼠标悬停时提亮并放大描边。
- * 只要目标身上有任意一个生效的 boost 就显示（多个效果合并为一个按钮）。
+ * 外观为游戏风格：半透明底色 + 原版图标 + 亮色描边。
+ * <b>按光标距离动态淡入</b>：不透明度取「光标到按钮中心距离」在 {@code [0, 3 格]} 上的线性插值——
+ * 贴到按钮上取上限 40%，随距离线性衰减到 0；超出该距离<b>整颗按钮与图标都不渲染</b>（也不可点击）。
+ * 只要目标身上有任意一个生效的 boost 就会绘制（多个效果合并为一个按钮）。
  *
  * <p><b>点击行为</b>：向消息面板投递一条 10s 时限消息——
  * 标题「{@code {方块名称}中生效的Boost}」，内容逐行列出「{@code 强化名称-强化效果}」。
@@ -44,18 +47,18 @@ public class BoostOverlay implements BuildingBoostSystem.VisualRenderer {
     private static final float iconRatio = 0.8f;
     /** 按钮底色（含 alpha，与消息气泡同色） */
     private static final Color buttonColor = Color.valueOf("99cc3366");
-    /** 常态底板不透明度（= 0x66） */
-    private static final float backAlpha = 0.4f;
-    /** 悬停时底板不透明度（更亮，提示可点） */
-    private static final float hoverBackAlpha = 0.62f;
-    /** 描边宽度 */
-    private static final float borderWidth = 0.6f;
-    /** 描边基础不透明度（悬停时提升到 hoverBorderAlpha） */
-    private static final float borderAlpha = 0.85f;
-    /** 悬停时描边不透明度 */
-    private static final float hoverBorderAlpha = 1f;
-    /** 悬停时额外放大幅度 */
-    private static final float hoverScale = 1.25f;
+    /**
+     * 按钮不透明度上限：光标极接近按钮时取该值（约 40%），随距离线性衰减到 0。
+     * 整个按钮（白边 + 底板 + 图标）统一按此透明度绘制。
+     */
+    private static final float maxAlpha = 0.4f;
+    /**
+     * 淡出距离（世界像素）：光标到按钮中心的距离超过该值时<b>直接不渲染</b>按钮与图标
+     * （也不可点击）；该距离内不透明度在 {@code maxAlpha → 0} 之间线性变化。
+     */
+    private static final float fadeDistance = tile * 3f;
+    /** 描边宽度（白边，内嵌法实现） */
+    private static final float borderWidth = 0.4f;
     /** 消息显示时限（秒） */
     private static final float messageLife = 10f;
     /** 标题本地化 key：{0} 为方块名称（以 [accent] 强调） */
@@ -70,6 +73,8 @@ public class BoostOverlay implements BuildingBoostSystem.VisualRenderer {
     private static final Rect view = new Rect();
     /** 上一帧绘制出的按钮命中区（世界坐标），供本帧点击命中测试 */
     private static final Seq<Hit> hits = new Seq<>();
+    /** 本帧已记录的按钮数：命中区槽位游标（<b>与 boost 序号 index 无关</b>，每帧从 0 重新计数）。 */
+    private static int hitCursor = 0;
 
     private static boolean inited = false;
 
@@ -91,6 +96,7 @@ public class BoostOverlay implements BuildingBoostSystem.VisualRenderer {
         // 渲染阶段：重置命中区 → 算视野 → 调度 System 绘制
         Events.run(EventType.Trigger.draw, () -> {
             hits.clear();
+            hitCursor = 0;
             Core.camera.bounds(view);
             BuildingBoostSystem.drawBoosts();
         });
@@ -115,33 +121,36 @@ public class BoostOverlay implements BuildingBoostSystem.VisualRenderer {
         float x = target.x - blockSize / 2f + size / 2f;
         float y = target.y - blockSize / 2f + size / 2f;
 
-        // 记录命中区（点击测试用上一帧的位置，避免与相机拖拽冲突）
-        Hit hit = hit(index);
+        // 按「光标到按钮中心距离」动态淡入：超出淡出距离直接不渲染（自然也不可点击）
+        float dist = Mathf.dst(Core.input.mouseWorldX(), Core.input.mouseWorldY(), x, y);
+        if (dist >= fadeDistance) {
+            return;
+        }
+        // 该距离内线性变化：贴到按钮上 → maxAlpha，接近淡出距离 → 0
+        float alpha = maxAlpha * (1f - dist / fadeDistance);
+
+        // 记录命中区（点击测试用）：与视觉尺寸一致（4×4px），故可见即可点。
+        // 槽位用本帧游标分配，**不能用 index**（index 是 boost 在目标身上的序号，恒为 0，
+        // 会让所有按钮共用一个槽位互相覆盖，最终只剩最后一个按钮可点）。
+        Hit hit = hit(hitCursor++);
         hit.target = target;
         hit.rect.set(x - size / 2f, y - size / 2f, size, size);
 
-        // 悬停判定（用世界坐标，光标在按钮矩形内即视为悬停）
-        boolean hovered = Core.input.mouseWorldX() >= hit.rect.x
-                && Core.input.mouseWorldX() <= hit.rect.x + hit.rect.width
-                && Core.input.mouseWorldY() >= hit.rect.y
-                && Core.input.mouseWorldY() <= hit.rect.y + hit.rect.height;
-
-        float draw = hovered ? size * hoverScale : size;
-        float half = draw / 2f;
         Color tint = visual.color();
         float prevZ = Draw.z();
         try {
             // 浮于方块之上，避免被建筑贴图盖住
             Draw.z(Layer.overlayUI);
-            // 底板：统一色（#99cc3366，与消息气泡同色），悬停时更亮以示可点
-            Draw.color(tint == null ? buttonColor : tint, hovered ? hoverBackAlpha : backAlpha);
-            Draw.rect(Core.atlas.white(), x, y, draw, draw);
-            // 描边：亮色细框，强化按钮观感
-            Draw.color(Color.white, hovered ? hoverBorderAlpha : borderAlpha);
-            Draw.rect(Core.atlas.white(), x, y, draw, draw, borderWidth);
+            // 底框：先铺一层白色矩形作为描边底（arc 的 rect 无描边参数，用内嵌法做边框）
+            Draw.color(Color.white, alpha);
+            Draw.rect(Core.atlas.white(), x, y, size, size);
+            // 底板：统一色（#99cc3366，与消息气泡同色），内缩一圈留出白边
+            float inner = size - borderWidth * 2f;
+            Draw.color(tint == null ? buttonColor : tint, alpha);
+            Draw.rect(Core.atlas.white(), x, y, inner, inner);
             // 图标本体（原版美术，不额外染色以保持原味）
-            Draw.color(Color.white);
-            Draw.rect(icon, x, y, draw * iconRatio, draw * iconRatio);
+            Draw.color(Color.white, alpha);
+            Draw.rect(icon, x, y, inner * iconRatio, inner * iconRatio);
         } finally {
             Draw.reset();
             Draw.z(prevZ);
@@ -162,10 +171,15 @@ public class BoostOverlay implements BuildingBoostSystem.VisualRenderer {
         if (!Core.input.keyTap(KeyCode.mouseLeft)) return;
         float wx = Core.input.mouseWorldX(), wy = Core.input.mouseWorldY();
         for (Hit hit : hits) {
-            if (hit.rect.contains(wx, wy)) {
-                postBoostInfo(hit.target);
+            if (!hit.rect.contains(wx, wy)) continue;
+            // 命中区是上一帧记录的（建筑静止故世界坐标稳定）；投递前再校验目标仍然有效且仍有强化，
+            // 避免点空或点到已失效的残留条目
+            Building target = hit.target;
+            if (target == null || !target.isValid() || !BuildingBoostSystem.hasActiveBoosts(target)) {
                 return;
             }
+            postBoostInfo(target);
+            return;
         }
     }
 
@@ -193,7 +207,8 @@ public class BoostOverlay implements BuildingBoostSystem.VisualRenderer {
                 .titleKey(titleKey)
                 .var(target.block.localizedName)
                 .background(bubbleColor)
-                .icon(blockIcon(target)));
+                .icon(blockIcon(target))
+                .local()); // 仅本地：只有点击者自己看到，不广播给其他玩家
     }
 
     /** 取建筑图标（uiIcon）作为消息图标；缺失时回退默认信息图标。 */

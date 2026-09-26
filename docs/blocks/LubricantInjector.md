@@ -60,8 +60,8 @@ Provider 落地实现。本方块**不再私写炮塔专用逻辑**，只负责�
 - 效果为**注入式**（`remove` 无残留），自动注册进 System（静态块 `register(instance)`）。
 - **视觉**：`visual()` 返回带原版状态图标（`StatusEffects.overclock.uiIcon`，风格与游戏一致）的
   `BoostVisual`；按钮底色统一用 `#99cc3366`（由渲染器默认提供）。受惠炮塔**左下角**显示一个
-  **0.5 格（4×4px）可点击按钮**（`BoostOverlay` 绘制 + 交互）。
-- **点击输出**：点击按钮向消息面板投递 10s 时限消息（气泡色 `#99cc3366`），
+  **0.5 格（4×4px）可点击按钮**（`BoostOverlay` 绘制 + 交互），按光标距离动态淡入（上限 40%，超出 3 格不渲染）。
+- **点击输出**：点击按钮向消息面板投递 10s 时限消息（气泡色 `#99cc3366`，**`.local()` 仅自己可见、不广播**），
   标题「[accent]{方块名}[]中生效的Boost」，内容行为「[cyan]润滑油[]：+100% 旋转速度；+20% 攻击速度」，
   **消息图标为该建筑自身的贴图**。
 - **面板文案**：`name()` / `description()` 走 bundle（`boost.lubricant.name` / `boost.lubricant.desc`），
