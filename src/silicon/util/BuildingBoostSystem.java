@@ -1,6 +1,7 @@
 package silicon.util;
 
 import arc.graphics.Color;
+import arc.graphics.g2d.TextureRegion;
 import arc.struct.ObjectMap;
 import arc.struct.ObjectSet;
 import arc.struct.Seq;
@@ -18,8 +19,9 @@ import mindustry.world.blocks.defense.turrets.Turret;
  * <p>职责划分：
  * <ul>
  *   <li><b>驱动</b>：强化器每帧调一次 {@link #updateBoosts(Provider)}，System 先把
- *       所有强化器对同一目标的意愿合并去重，再在每 tick 统一裁决一次后应用/撤销——
- *       保证同一个目标、同一个效果 id，一帧最多调用一次 {@link Boost#apply(Building)}；</li>
+ *       所有强化器对同一目标的意愿合并去重（记入持久认领表 {@code contributors}），再在每 tick
+ *       统一裁决一次后应用/撤销——保证同一个目标、同一个效果 id，一 tick 最多调用一次
+ *       {@link Boost#apply(Building)}；</li>
  *   <li><b>不叠加规则</b>：一个目标只能持有同一效果的一份（如同"两个一样的 buff 不会并存"）。
  *       即使多个强化器同时为一个目标提供同一效果，效果也只生效一份、不会成倍放大；</li>
  *   <li><b>资格与队伍</b>：目标过滤四层把关，任何效果生效前都过这几关，
@@ -33,8 +35,8 @@ import mindustry.world.blocks.defense.turrets.Turret;
  *       </ol></li>
  *   <li><b>生命周期（持续由强化器控制）</b>：效果只要强化器还在提供（如仍存油）就持续生效；
  *       强化器停止提供/被拆除/目标失效时，System 自动撤销（{@link Boost#remove(Building)}），
- *       不留残留——强化器经 {@link #removeProvider(Provider)}（在其 removed() 里调用）
- *       或在每帧清扫中发现失效而主动清理；</li>
+ *       不留残留——强化器经 {@link #removeProvider(Provider)}（在其 onRemoved() 里调用）
+ *       即时清理，或由每 tick 一次的清扫兜底；</li>
  *   <li><b>互斥裁决</b>：冲突关系声明在每个 {@link Boost} 实现里
  *       （{@link Boost#conflictsWith(String)} + {@link Boost#priority()}），
  *       裁决与执行由本系统统一完成：同目标上冲突效果按优先级（同级按 id 字典序）选胜者，
@@ -47,6 +49,17 @@ import mindustry.world.blocks.defense.turrets.Turret;
  * <p>apply/remove 语义：激活期间（count>0 且未被挂起）每帧调用一次 {@link Boost#apply(Building)}
  * （注入式每帧累加；引用式需幂等，首次才真正改动字段）；条件失格后调用一次
  * {@link Boost#remove(Building)} 干净撤销。
+ *
+ * <p><b>多人兼容约定</b>：本系统状态（contributors/active/…）是纯 JVM 本地的，客户端与服务器各自
+ * 独立驱动，不做任何网络同步——因为它只影响<b>本地模拟</b>（炮塔充能/转角等），
+ * 而这些量在两端由相同输入算出相同结果。为此要求：
+ * <ol>
+ *   <li><b>队伍检查</b>：一律用 {@code ==} 比较 {@link mindustry.game.Team}（枚举单例，跨端一致，
+ *       天然排除敌队/derelict），禁止用 {@code equals/ordinal} 之外的假设或本地玩家身份做判定；</li>
+ *   <li><b>确定性</b>：任何影响<b>网络化状态</b>（如液体量、功率、库存）的决策都不得依赖
+ *       「谁先跑 update()」或遍历顺序——必须由两端一致的量（tile 坐标、建筑 id、队伍、同步的液体量等）
+ *       推导。参考实现：{@code LubricantInjector.owns()}（按 tile 坐标裁决唯一认领者）。</li>
+ * </ol>
  */
 public final class BuildingBoostSystem {
 
@@ -55,7 +68,14 @@ public final class BuildingBoostSystem {
 
     /** 渲染接入接口：System 负责调度，具体画法尚未定型。 */
     public interface VisualRenderer {
-        void render(Building target, BoostVisual visual);
+        /**
+         * 绘制某个目标身上的一个生效 boost 徽记。
+         *
+         * @param target 受惠目标（非空、已生效）
+         * @param visual 该 boost 的视觉描述（非空）
+         * @param index  该 boost 在目标身上的序号（0 起）——供渲染器把多个徽记依次排开
+         */
+        void render(Building target, BoostVisual visual, int index);
     }
 
     /** 可被强化的方块类型名单：只有命中的方块才允许被施加任何强化。默认仅放行炮塔。 */
@@ -64,11 +84,8 @@ public final class BuildingBoostSystem {
     /** 注册表：id → 效果单元，加载期由各 boost 自动注册。 */
     private static final ObjectMap<String, Boost> registry = new ObjectMap<>();
 
-    /** 贡献者：目标 → (boost id → 当前希望其生效的强化器集合)，用于去重/计数/撤销归属。 */
+    /** 贡献者：目标 → (boost id → 当前希望其生效的强化器集合）。计数即集合人数，亦是撤销归属。 */
     private static final ObjectMap<Building, ObjectMap<String, ObjectSet<Provider>>> contributors = new ObjectMap<>();
-
-    /** 本 tick 待裁决意愿：目标 → (boost id → 希望其生效的强化器数量)，跨强化器累计。 */
-    private static final ObjectMap<Building, ObjectMap<String, Integer>> pending = new ObjectMap<>();
 
     /** 互斥挂起：目标 → (败者 id → 胜者 id)。胜者仍占位期间败者保持不生效。 */
     private static final ObjectMap<Building, ObjectMap<String, String>> suppressed = new ObjectMap<>();
@@ -78,6 +95,13 @@ public final class BuildingBoostSystem {
 
     /** 存活强化器集合：用于每帧清扫失效 provider（防穿漏）。 */
     private static final ObjectSet<Provider> providerSet = new ObjectSet<>();
+
+    /** 冲洗缓冲：复用以避免每 tick 新建集合（先收集再处理，规避 keys() 边遍历边改）。 */
+    private static final ObjectSet<Building> flushBuffer = new ObjectSet<>();
+    /** removeProvider 受影响目标缓冲（复用，避免每次分配）。 */
+    private static final Seq<Building> affectedBuffer = new Seq<>();
+    /** 撤销/回收 id 暂存缓冲（复用；ObjectMap 边遍历边 remove 会抛并发修改异常，须先收集）。 */
+    private static final Seq<String> idBuffer = new Seq<>();
 
     /** 已冲洗本 tick 的标记（按世界 tick 归组，保证一帧只统一裁决一次）。 */
     private static double flushedTick = Double.MIN_VALUE;
@@ -112,6 +136,21 @@ public final class BuildingBoostSystem {
 
         /** 唯一 id：自动注册进 System 注册表、供互斥声明与日志引用。 */
         String id();
+
+        /**
+         * 显示名称（本地化）：用于强化面板等 UI 展示。
+         * 默认取 {@link #id()}，实现应覆写为可读名称（建议走 bundle 归类管理）。
+         */
+        default String name() {
+            return id();
+        }
+
+        /**
+         * 简要强化描述（本地化）：一句话说明本效果带来的收益，如
+         * 「+100% 旋转速度；+20% 攻击速度」。用于强化面板展示，<b>每个 Boost 必须给出</b>。
+         * 实现建议走 bundle 归类管理；数值应与实际生效值一致。
+         */
+        String description();
 
         /**
          * 目标过滤：System 在登记贡献前读取本方法，控制本效果能否作用于该目标
@@ -165,15 +204,20 @@ public final class BuildingBoostSystem {
         /** 自身建筑实体（System 以此取队伍/位置/团队资格）。 */
         Building building();
 
-        /** 候选目标集合（默认取紧贴 proximity；范围型强化器可自行覆盖）。 */
-        default Iterable<Building> targets() {
+        /** 候选目标集合（默认取紧贴 proximity；范围型强化器可自行覆盖）。
+         *  <p>返回 {@link Seq} 以便 System 走下标遍历（零迭代器分配）；实现方宜复用同一 Seq 实例，
+         *  避免每帧新建。 */
+        default Seq<Building> targets() {
             return building().proximity;
         }
 
-        /** 本强化器提供的效果单元列表（可来自 System 注册表按 id 引用，也可直接持有实例）。 */
-        Iterable<Boost> boosts();
+        /** 本强化器提供的效果单元列表（可来自 System 注册表按 id 引用，也可直接持有实例）。
+         *  <p>返回 {@link Seq} 以便零分配遍历；实现方宜复用/缓存该 Seq。 */
+        Seq<Boost> boosts();
 
-        /** 强化器自身的附加目标过滤（如朝向/距离），默认全放行；队伍与名单由 System 统一判。 */
+        /** 强化器自身的附加目标过滤（如朝向/距离），默认全放行；队伍与名单由 System 统一判。
+         *  <p><b>多人注意</b>：本方法在客户端与服务器都会执行且结果必须一致——不得依赖 update 顺序
+         *  或本地状态，否则两端提供集合不同会造成分歧。 */
         default boolean canTarget(Building target) {
             return true;
         }
@@ -191,7 +235,8 @@ public final class BuildingBoostSystem {
 
     /**
      * 视觉描述（可空，预留扩展点）：boost 通过它「告诉 System 显示什么」。
-     * 调试阶段由 {@link BoostOverlay} 在目标方块上方绘制 {@link #label(Building)}；
+     * 调试阶段由 {@link BoostOverlay} 在目标方块**左下角**绘制 {@link #icon(Building)} 徽记；
+     * 只要目标身上有任意一个生效的 boost 就显示（多个则沿底边依次排开）。
      * {@link #type()} 供渲染管线分发（未定型，先用类名自由扩展）。
      */
     public interface BoostVisual {
@@ -201,12 +246,13 @@ public final class BuildingBoostSystem {
             return getClass().getSimpleName();
         }
 
-        /** 显示名称：调试渲染时绘制在目标方块上方（null/空串则不绘制文字）。 */
-        default String label(Building target) {
+        /** 强化图标：建议直接取用原版图集资源以贴合游戏风格（如 {@code StatusEffects.xx.uiIcon}）。
+         *  null 则该效果不绘制图标。 */
+        default TextureRegion icon(Building target) {
             return null;
         }
 
-        /** 显示颜色：调试渲染文字用色（null 用渲染器默认色）。 */
+        /** 徽记配色（背景/描边用，null 用渲染器默认色）。 */
         default Color color() {
             return null;
         }
@@ -245,32 +291,51 @@ public final class BuildingBoostSystem {
         registry.put(boost.id(), boost);
     }
 
-    /** 查询目标上当前生效的效果集（只读视角，null 安全）。 */
-    public static ObjectSet<String> activeBoosts(Building target) {
-        ObjectSet<String> out = new ObjectSet<>();
+    /**
+     * 查询目标上当前生效的效果单元列表（按显示顺序无关，null 安全）。
+     * 供强化面板等 UI 展示：可取 {@link Boost#name()} / {@link Boost#description()} / {@link Boost#visual(Building)}。
+     *
+     * <p>注意：每次调用会新建 Seq，仅供点击/打开面板等低频路径使用，勿放进每帧循环。
+     */
+    public static Seq<Boost> activeBoosts(Building target) {
+        Seq<Boost> out = new Seq<>();
         ObjectMap<String, Boolean> map = active.get(target);
         if (map != null) {
             for (String id : map.keys()) {
-                if (map.get(id, false)) {
-                    out.add(id);
+                if (!Boolean.TRUE.equals(map.get(id))) {
+                    continue;
+                }
+                Boost boost = registry.get(id);
+                if (boost != null) {
+                    out.add(boost);
                 }
             }
         }
         return out;
     }
 
-    /** 认领检查（供强化器在自己 canTarget 里调用）：目标该效果是否已被「其它」强化器登记提供。
-     *  true = 已被别人抢先，本机应取消提供（不叠加 + 唯生效者耗资源的协作手段）。 */
-    public static boolean claimedByOther(Building target, Provider provider, String boostId) {
-        ObjectMap<String, ObjectSet<Provider>> tmap = contributors.get(target);
-        if (tmap == null) {
+    /** 目标上是否还有生效的强化（零分配，供每帧轮询类逻辑使用）。 */
+    public static boolean hasActiveBoosts(Building target) {
+        ObjectMap<String, Boolean> map = active.get(target);
+        if (map == null) {
             return false;
         }
-        ObjectSet<Provider> set = tmap.get(boostId);
-        return set != null && set.size > 0 && !set.contains(provider);
+        for (String id : map.keys()) {
+            if (Boolean.TRUE.equals(map.get(id))) {
+                return true;
+            }
+        }
+        return false;
     }
 
-    /** 提供归属查询（供强化器决定是否耗资源）：本机当前是否已登记为该目标该效果的有效提供者。 */
+    /**
+     * 提供归属查询（供强化器决定是否耗资源）：本机当前是否已登记为该目标该效果的有效提供者。
+     *
+     * <p><b>多人注意</b>：本判定读的是 {@code contributors}（由两端一致的输入推导），故两端结果相同；
+     * 可安全用于决定液体等网络化资源的扣减。相对地，<b>不要</b>用「谁先跑 update」这类顺序依赖的规则
+     * 决定耗资源——那会因两端 update 顺序不同造成液体分歧（desync）。需要「唯一归属」时，请用
+     * tile 坐标/建筑 id 等两端一致的量裁决（参考 {@code LubricantInjector#owns}）。
+     */
     public static boolean isProviderOf(Building target, Provider provider, String boostId) {
         ObjectMap<String, ObjectSet<Provider>> tmap = contributors.get(target);
         if (tmap == null) {
@@ -295,16 +360,19 @@ public final class BuildingBoostSystem {
         }
 
         providerSet.add(provider);
-        for (Building target : provider.targets()) {
-            if (target == null || !target.isValid()) {
+
+        Seq<Building> targets = provider.targets();
+        if (targets == null || targets.isEmpty()) {
+            return;
+        }
+        for (Building target : targets) {
+            if (target == null || target == building || !target.isValid()) {
                 continue;
             }
             // 先登记本强化器对目标各效果的本 tick 意愿（0/1，跨强化器去重累计）
             collectContributions(provider, target,
                     sameTeam(building, target) && isBoostable(target) && provider.canTarget(target));
         }
-
-        sweepInvalid();
     }
 
     /** 撤销强化器：清掉它的全部贡献并即时重算受影响目标（防止贡献残留、效果失控）。 */
@@ -318,65 +386,106 @@ public final class BuildingBoostSystem {
 
     // —— 内部：贡献登记 ——
 
+    /**
+     * 登记/撤销本强化器对某目标各效果的意愿。
+     *
+     * <p><b>零分配</b>：仅在强化器真正「加入/退出」某效果集合时才创建对应内层容器；
+     * 稳态（已在集合内、意愿不变）不新建任何对象。空集合即时回收，避免状态表膨胀。
+     */
     private static void collectContributions(Provider provider, Building target, boolean eligible) {
-        ObjectMap<String, ObjectSet<Provider>> targetContributors = contributors.get(target, ObjectMap::new);
-        ObjectMap<String, Integer> targetPending = pending.get(target, ObjectMap::new);
+        ObjectMap<String, ObjectSet<Provider>> targetContributors = contributors.get(target);
 
-        for (Boost boost : provider.boosts()) {
+        Seq<Boost> boosts = provider.boosts();
+        for (int i = 0, n = boosts.size; i < n; i++) {
+            Boost boost = boosts.get(i);
+            String id = boost.id();
             // 生效意愿 = 公共关(队伍/名单/Provider.canTarget) && Boost 自身目标过滤 && 触发条件
             boolean want = eligible && boost.canTarget(target) && boost.shouldApply(target);
-            ObjectSet<Provider> set = targetContributors.get(boost.id(), ObjectSet::new);
-            if (want && !set.contains(provider)) {
-                set.add(provider);
-            } else if (!want && set.contains(provider)) {
-                set.remove(provider);
-            }
-            // 每帧按集合人数【重算】本 tick 意愿计数，而非只在增删时增量：
-            // contributors 跨帧持久、pending 每 tick 冲洗即清空，只靠增量会导致首帧后计数永远为空。
-            putCount(targetPending, boost.id(), set.size);
-        }
-    }
 
-    private static void putCount(ObjectMap<String, Integer> map, String id, int value) {
-        if (value <= 0) {
-            map.remove(id);
-        } else {
-            map.put(id, value);
+            ObjectSet<Provider> set = targetContributors == null ? null : targetContributors.get(id);
+            if (want) {
+                if (set == null) {
+                    if (targetContributors == null) {
+                        targetContributors = contributors.get(target, ObjectMap::new);
+                    }
+                    set = targetContributors.get(id, ObjectSet::new);
+                }
+                set.add(provider);
+            } else if (set != null && set.remove(provider)) {
+                if (set.isEmpty()) {
+                    // 该效果已无人提供 → 连空集合一并回收
+                    targetContributors.remove(id);
+                    if (targetContributors.isEmpty()) {
+                        // 目标已无任何贡献 → 回收条目，并置空局部引用，
+                        // 使后续 boost 仍能重新建表（不能 return，否则会漏掉后面的效果）
+                        contributors.remove(target);
+                        targetContributors = null;
+                    }
+                }
+            }
+            // 意愿恒由 contributors 的集合人数表达（无独立计数），无需额外记账
         }
     }
 
     // —— 内部：每 tick 统一冲洗（裁决 + 应用/撤销） ——
 
+    /**
+     * 每 tick 一次的统一冲洗。
+     *
+     * <p>「本 tick 应生效集合」直接由 {@link #contributors} 推导——冲洗发生在本 tick 首个强化器
+     * 登记<b>之前</b>，此时 contributors 恰好仍是上一 tick 登记完的最终状态，故无需额外 pending 快照
+     * （省掉每目标每 tick 的内层 Map 分配与计数维护）。
+     */
     private static void flushFrame() {
-        ObjectSet<Building> targets = new ObjectSet<>();
-        for (Building b : pending.keys()) {
-            targets.add(b);
+        // 先收集后处理：keys() 迭代器依赖内部数组，而下面会增删状态表
+        flushBuffer.clear();
+        for (Building target : contributors.keys()) {
+            flushBuffer.add(target);
         }
-        for (Building b : active.keys()) {
-            targets.add(b);
+        for (Building target : active.keys()) {
+            flushBuffer.add(target); // 覆盖「曾生效但已无贡献」→ 需走撤销
         }
-        for (Building target : targets) {
-            ObjectMap<String, Integer> desired = pending.get(target);
-            resolveMutex(target, desired);
-            reconcile(target, desired);
+
+        for (Building target : flushBuffer) {
+            ObjectMap<String, ObjectSet<Provider>> tmap = contributors.get(target);
+            resolveMutex(target, tmap);
+            reconcile(target, tmap);
         }
-        pending.clear();
+
+        sweepInvalid();
+    }
+
+    /** 取某效果当前的提供者人数（无提供者记 0）。 */
+    private static int count(ObjectMap<String, ObjectSet<Provider>> tmap, String id) {
+        if (tmap == null) {
+            return 0;
+        }
+        ObjectSet<Provider> set = tmap.get(id);
+        return set == null ? 0 : set.size;
     }
 
     /**
      * 互斥裁决：目标上冲突的效果按优先级（同级 id 字典序）选胜者，败者挂起；
      * 挂起表每次裁决按本帧结论重建——胜者仍在则败者继续挂起，胜者消失则败者自然参选。
      */
-    private static void resolveMutex(Building target, ObjectMap<String, Integer> desired) {
+    private static void resolveMutex(Building target, ObjectMap<String, ObjectSet<Provider>> tmap) {
+        // 快速路径：至多一个效果时不可能冲突（绝大多数场景），直接清挂起表
+        if (tmap == null || tmap.size <= 1) {
+            suppressed.remove(target);
+            return;
+        }
+
         ObjectMap<String, String> next = new ObjectMap<>();
 
         Seq<String> ids = new Seq<>();
-        if (desired != null) {
-            for (String id : desired.keys()) {
-                if (desired.get(id, 0) > 0) {
-                    ids.add(id);
-                }
+        for (String id : tmap.keys()) {
+            if (count(tmap, id) > 0) {
+                ids.add(id);
             }
+        }
+        if (ids.size <= 1) {
+            suppressed.remove(target);
+            return;
         }
 
         // 高优先级优先，同级按 id 字典序（结果确定、跨强化器一致）
@@ -411,63 +520,51 @@ public final class BuildingBoostSystem {
     }
 
     /**
-     * 应用/撤销：以「desired>0 且未被挂起」为应生效集合，对比上帧生效状态——
-     * 生效则本帧调一次 apply（不叠加），失格则调一次 remove。
+     * 应用/撤销：以「有人提供且未被挂起」为应生效集合——应生效的<b>每 tick 调用一次 apply</b>
+     * （保证注入式逐帧累加、不叠加），不再应生效的调用一次 remove。
+     * 生效状态表<b>原地更新</b>，不每 tick 新建快照对象。
      */
-    private static void reconcile(Building target, ObjectMap<String, Integer> desired) {
+    private static void reconcile(Building target, ObjectMap<String, ObjectSet<Provider>> tmap) {
         ObjectMap<String, String> targetSuppressed = suppressed.get(target);
+        ObjectMap<String, Boolean> state = active.get(target);
 
-        Seq<String> ids = new Seq<>();
-        ObjectMap<String, Boolean> last = active.get(target);
-        if (last != null) {
-            ids.addAll(last.keys());
-        }
-        if (desired != null) {
-            for (String id : desired.keys()) {
-                if (!ids.contains(id)) {
-                    ids.add(id);
+        // 1) 应用：应生效集合逐个 apply（本 tick 一次）
+        if (tmap != null) {
+            for (String id : tmap.keys()) {
+                if (count(tmap, id) <= 0) continue;
+                if (targetSuppressed != null && targetSuppressed.containsKey(id)) continue;
+                Boost boost = registry.get(id);
+                if (boost == null) continue;
+                boost.apply(target);
+                if (state == null) {
+                    state = new ObjectMap<>();
+                    active.put(target, state);
+                }
+                if (!Boolean.TRUE.equals(state.get(id))) {
+                    state.put(id, true);
                 }
             }
         }
 
-        boolean any = false;
-        ObjectMap<String, Boolean> snapshot = new ObjectMap<>();
-        for (String id : ids) {
-            Boost boost = registry.get(id);
-            if (boost == null) {
-                continue;
+        // 2) 撤销：已不满足「有人提供且未被挂起」的（先收集再删——keys() 边遍历边 remove 会抛并发修改）
+        if (state != null) {
+            idBuffer.clear();
+            for (String id : state.keys()) {
+                if (count(tmap, id) > 0 && (targetSuppressed == null || !targetSuppressed.containsKey(id))) {
+                    continue; // 仍生效
+                }
+                idBuffer.add(id);
             }
-            boolean now = desired != null && desired.get(id, 0) > 0
-                    && (targetSuppressed == null || !targetSuppressed.containsKey(id));
-            boolean was = last != null && Boolean.TRUE.equals(last.get(id));
-            if (now) {
-                boost.apply(target);
-            } else if (was) {
-                boost.remove(target);
+            for (String id : idBuffer) {
+                Boost boost = registry.get(id);
+                if (boost != null) {
+                    boost.remove(target);
+                }
+                state.remove(id);
             }
-            snapshot.put(id, now);
-            any |= now;
-        }
-
-        if (any) {
-            active.put(target, snapshot);
-        } else {
-            active.remove(target);
-        }
-
-        // 清理空态，防泄漏
-        ObjectMap<String, Integer> tp = pending.get(target);
-        if (tp != null && tp.isEmpty()) {
-            pending.remove(target);
-        }
-        ObjectMap<String, ObjectSet<Provider>> tc = contributors.get(target);
-        if (tc != null) {
-            boolean dead = true;
-            for (ObjectSet<Provider> set : tc.values()) {
-                dead &= set.isEmpty();
-            }
-            if (dead) {
-                contributors.remove(target);
+            idBuffer.clear();
+            if (state.isEmpty()) {
+                active.remove(target);
             }
         }
     }
@@ -475,64 +572,49 @@ public final class BuildingBoostSystem {
     // —— 内部：强化器/目标生命周期清理 ——
 
     private static void removeProviderContributions(Provider provider) {
-        Seq<Building> affected = new Seq<>();
+        // 全程「先收集后删除」：contributors/tmap 的 keys() 迭代期间不得修改其自身结构
+        affectedBuffer.clear();
         for (Building target : contributors.keys()) {
             ObjectMap<String, ObjectSet<Provider>> tmap = contributors.get(target);
-            ObjectMap<String, Integer> targetPending = pending.get(target);
             boolean changed = false;
+            idBuffer.clear();
             for (String id : tmap.keys()) {
                 ObjectSet<Provider> set = tmap.get(id);
                 if (set.remove(provider)) {
                     changed = true;
-                    if (targetPending != null) {
-                        // 同步按剩余人数重算计数
-                        putCount(targetPending, id, set.size);
+                    if (set.isEmpty()) {
+                        idBuffer.add(id); // 延后回收空集合
                     }
                 }
             }
+            for (String id : idBuffer) {
+                tmap.remove(id);
+            }
+            idBuffer.clear();
             if (changed) {
-                affected.add(target);
+                affectedBuffer.add(target);
             }
         }
-        // 收集完再做重算（避免边遍历边改 contributors）
-        for (Building target : affected) {
-            ObjectMap<String, Integer> desired = new ObjectMap<>();
+
+        for (Building target : affectedBuffer) {
             ObjectMap<String, ObjectSet<Provider>> tmap = contributors.get(target);
-            if (tmap != null) {
-                for (String id : tmap.keys()) {
-                    if (tmap.get(id).size > 0) {
-                        desired.put(id, tmap.get(id).size);
-                    }
-                }
+            if (tmap != null && tmap.isEmpty()) {
+                contributors.remove(target); // 该目标已无任何贡献，回收条目
             }
-            resolveMutex(target, desired);
-            reconcile(target, desired);
+            resolveMutex(target, tmap);
+            reconcile(target, tmap);
         }
+        affectedBuffer.clear();
     }
 
-    /** 清扫已失效目标/强化器：杜绝被拆除的建筑在状态表里残留。 */
+    /** 清扫已失效目标/强化器：杜绝被拆除的建筑在状态表里残留（每 tick 一次，随 flushFrame 触发）。 */
     private static void sweepInvalid() {
+        // 先收集再删除：ObjectMap 的 keys() 迭代器依赖内部数组，
+        // 边遍历边 remove 会抛并发修改异常/漏扫，故与强化器侧同样先收集后处理。
         ObjectSet<Building> badTargets = new ObjectSet<>();
-        for (Building target : active.keys()) {
-            if (!target.isValid()) {
-                badTargets.add(target);
-            }
-        }
-        for (Building target : pending.keys()) {
-            if (!target.isValid()) {
-                pending.remove(target);
-            }
-        }
-        for (Building target : contributors.keys()) {
-            if (!target.isValid()) {
-                contributors.remove(target);
-            }
-        }
-        for (Building target : suppressed.keys()) {
-            if (!target.isValid()) {
-                suppressed.remove(target);
-            }
-        }
+        collectInvalid(active.keys(), badTargets);
+        collectInvalid(contributors.keys(), badTargets);
+        collectInvalid(suppressed.keys(), badTargets);
         for (Building target : badTargets) {
             removeBuilding(target);
         }
@@ -546,6 +628,14 @@ public final class BuildingBoostSystem {
         }
         for (Provider provider : badProviders) {
             removeProvider(provider);
+        }
+    }
+
+    private static void collectInvalid(Iterable<Building> keys, ObjectSet<Building> out) {
+        for (Building target : keys) {
+            if (target == null || !target.isValid()) {
+                out.add(target);
+            }
         }
     }
 
@@ -563,12 +653,14 @@ public final class BuildingBoostSystem {
             }
         }
         active.remove(target);
-        pending.remove(target);
         contributors.remove(target);
         suppressed.remove(target);
     }
 
-    /** 视觉调度：渲染管线在每帧绘制阶段调用；内容由各 boost 的 {@link Boost#visual(Building)} 提供。 */
+    /**
+     * 视觉调度：渲染管线在每帧绘制阶段调用；内容由各 boost 的 {@link Boost#visual(Building)} 提供。
+     * 只要目标身上有任意一个生效的 boost 就会回调一次渲染（序号 index 供多个徽记排开）。
+     */
     public static void drawBoosts() {
         if (visualRenderer == null) {
             return;
@@ -578,6 +670,7 @@ public final class BuildingBoostSystem {
             if (map == null) {
                 continue;
             }
+            int index = 0;
             for (String id : map.keys()) {
                 if (!Boolean.TRUE.equals(map.get(id))) {
                     continue;
@@ -588,7 +681,7 @@ public final class BuildingBoostSystem {
                 }
                 BoostVisual visual = boost.visual(target);
                 if (visual != null) {
-                    visualRenderer.render(target, visual);
+                    visualRenderer.render(target, visual, index++);
                 }
             }
         }

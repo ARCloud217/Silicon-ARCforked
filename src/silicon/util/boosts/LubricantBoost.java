@@ -1,8 +1,8 @@
 package silicon.util.boosts;
 
 import arc.Core;
-import arc.graphics.Color;
 import arc.math.Angles;
+import mindustry.content.StatusEffects;
 import mindustry.gen.Building;
 import mindustry.world.blocks.defense.turrets.BaseTurret;
 import mindustry.world.blocks.defense.turrets.Turret;
@@ -42,6 +42,17 @@ public class LubricantBoost implements BuildingBoostSystem.Boost {
         return "lubricant";
     }
 
+    @Override
+    public String name() {
+        return Core.bundle.get("boost.lubricant.name", "Lubricant");
+    }
+
+    @Override
+    public String description() {
+        // 描述需与实际生效值一致：转角 ×2（+100%）、攻速 +20%
+        return Core.bundle.get("boost.lubricant.desc", "+100% rotation speed; +20% attack speed");
+    }
+
     // 目标过滤：只作用于炮塔。System 登记前读取本方法，非炮塔目标不登记贡献、不会进 apply。
     @Override
     public boolean canTarget(Building target) {
@@ -51,7 +62,8 @@ public class LubricantBoost implements BuildingBoostSystem.Boost {
     @Override
     public boolean shouldApply(Building target) {
         // 任一子效果具备生效条件即保持激活；具体注入逐项按需进行
-        return target instanceof Turret.TurretBuild t && (t.isShooting() || (t.hasAmmo() && t.shouldTurn()));
+        return target instanceof Turret.TurretBuild t
+                && (t.isShooting() || (t.hasAmmo() && t.shouldTurn()));
     }
 
     @Override
@@ -60,14 +72,17 @@ public class LubricantBoost implements BuildingBoostSystem.Boost {
             return;
         }
 
+        boolean shooting = t.isShooting();
+        boolean hasAmmo = t.hasAmmo();
+
         // —— 攻速子效果：仅攻击中的炮塔 ——
-        if (t.isShooting()) {
-            float ammoRM = t.hasAmmo() ? t.peekAmmo().reloadMultiplier : 1f;
+        if (shooting) {
+            float ammoRM = hasAmmo ? t.peekAmmo().reloadMultiplier : 1f;
             t.reloadCounter += firePotency * t.edelta() * ammoRM;
         }
 
         // —— 转角子效果：有弹药且允许转身时 ——
-        if (t.hasAmmo() && t.shouldTurn()) {
+        if (hasAmmo && t.shouldTurn()) {
             // 本帧无可瞄准角（目标无效/未锁定）则跳过，不干扰引擎
             float des;
             if (t.controlled()) {
@@ -95,18 +110,16 @@ public class LubricantBoost implements BuildingBoostSystem.Boost {
         return LubricantVisual.instance;
     }
 
-    /** 调试视觉：在受惠炮塔上方显示润滑油强化名（颜色取润滑油液体的 8a5a2b）。 */
+    /** 视觉描述：受惠炮塔左下角显示原版「超频」状态图标（overclock），底板用游戏强调色 Pal.accent。 */
     private static class LubricantVisual implements BuildingBoostSystem.BoostVisual {
         static final LubricantVisual instance = new LubricantVisual();
 
         @Override
-        public String label(Building target) {
-            return Core.bundle.get("boost.lubricant.name", "lubricant");
+        public arc.graphics.g2d.TextureRegion icon(Building target) {
+            // 原版状态图标：攻速增益语义一致，且是游戏自带美术，风格统一
+            return StatusEffects.overclock.uiIcon;
         }
 
-        @Override
-        public Color color() {
-            return Color.valueOf("8a5a2b");
-        }
+        // 底板色交由渲染器默认（Pal.accent 绿），此处不覆写
     }
 }
