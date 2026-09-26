@@ -24,6 +24,7 @@ import mindustry.ui.dialogs.BaseDialog;
 import mindustry.ui.dialogs.SettingsMenuDialog;
 import silicon.content.block.Blocks;
 import silicon.content.item.Items;
+import silicon.util.BoostOverlay;
 import silicon.util.MessageSync;
 import silicon.util.MessageSystem;
 import silicon.util.SiliconLog;
@@ -103,6 +104,7 @@ public class Silicon extends Mod {
         MineConverter.initNetworking();
         ItemTransferHub.initNetworking();
         SignalOverlay.init();
+        BoostOverlay.init();
         // 消息系统多人联网同步（nop 当不在服务器上时，仅注册事件处理器）
         MessageSync.init();
 

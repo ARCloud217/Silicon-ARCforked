@@ -147,7 +147,7 @@ public class MessagePanel extends Table implements MessageSystem.Listener {
         if (this.expanded && this.pane != null && Time.globalTime - this.expandTime > 0.35f) {
             this.markVisibleRead();
         }
-        if (this.expanded && this.pane != null && Core.scene != null && !this.hasMouse() && Core.scene.getScrollFocus() == this.pane) {
+        if (this.pane != null && Core.scene != null && Core.scene.getScrollFocus() == this.pane && (!this.expanded || !this.hasMouse())) {
             Core.scene.setScrollFocus(null);
         }
         if (this.scrollToTopPending) {
