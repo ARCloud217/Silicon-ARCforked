@@ -24,8 +24,9 @@ import mindustry.graphics.Pal;
  *
  * <p><b>按钮</b>：固定 0.5 格（4×4px）大小，锚在 footprint 左下角那一格的<b>内侧</b>（紧贴角、不越出方块）。
  * 外观为游戏风格：半透明底色 + 原版图标 + 亮色描边。
- * <b>按光标距离动态淡入</b>：不透明度取「光标到按钮中心距离」在 {@code [0, 3 格]} 上的线性插值——
- * 贴到按钮上取上限 40%，随距离线性衰减到 0；超出该距离<b>整颗按钮与图标都不渲染</b>（也不可点击）。
+ * <p><b>按光标距离动态淡入（分段）</b>：不透明度取「光标到按钮中心距离」的分段线性值——
+ * {@code ≤ 2 格}取上限 <b>80%</b>；{@code 2 ~ 10 格}线性衰减到 0；
+ * 超出 <b>10 格</b>则<b>整颗按钮与图标都不渲染</b>（也不可点击）。
  * 只要目标身上有任意一个生效的 boost 就会绘制（多个效果合并为一个按钮）。
  *
  * <p><b>点击行为</b>：向消息面板投递一条 10s 时限消息——
@@ -48,15 +49,21 @@ public class BoostOverlay implements BuildingBoostSystem.VisualRenderer {
     /** 按钮底色（含 alpha，与消息气泡同色） */
     private static final Color buttonColor = Color.valueOf("99cc3366");
     /**
-     * 按钮不透明度上限：光标极接近按钮时取该值（约 40%），随距离线性衰减到 0。
+     * 按钮不透明度上限：光标进入 {@link #nearDistance} 内即取该值（80%），
+     * 之后在 {@code [nearDistance, fadeDistance]} 上线性衰减到 0。
      * 整个按钮（白边 + 底板 + 图标）统一按此透明度绘制。
      */
-    private static final float maxAlpha = 0.4f;
+    private static final float maxAlpha = 0.8f;
+    /**
+     * 满不透明度距离（世界像素）：光标到按钮中心的距离 ≤ 该值时，透明度恒为 {@link #maxAlpha}。
+     */
+    private static final float nearDistance = tile * 2f;
     /**
      * 淡出距离（世界像素）：光标到按钮中心的距离超过该值时<b>直接不渲染</b>按钮与图标
-     * （也不可点击）；该距离内不透明度在 {@code maxAlpha → 0} 之间线性变化。
+     * （也不可点击）。该距离内，透明度分段：{@code [0, nearDistance]} 取 {@link #maxAlpha}，
+     * {@code [nearDistance, fadeDistance]} 线性降到 0。
      */
-    private static final float fadeDistance = tile * 3f;
+    private static final float fadeDistance = tile * 10f;
     /** 描边宽度（白边，内嵌法实现） */
     private static final float borderWidth = 0.4f;
     /** 消息显示时限（秒） */
@@ -106,8 +113,11 @@ public class BoostOverlay implements BuildingBoostSystem.VisualRenderer {
 
     @Override
     public void render(Building target, BuildingBoostSystem.BoostVisual visual, int index) {
-        if (target == null || visual == null) return;
-        TextureRegion icon = visual.icon(target);
+        if (target == null) return;
+        // 图标统一：优先用效果自带的，缺失则回落到全局统一图标（BuildingBoostSystem.badgeIcon），
+        // 保证「只要有任意强化生效就一定能看到徽记」，不会因某个效果忘了给图标而不显示
+        TextureRegion icon = visual == null ? null : visual.icon(target);
+        if (icon == null) icon = BuildingBoostSystem.badgeIcon();
         if (icon == null) return;
         // 只显示己方（多人下防止透视对手强化）
         if (Vars.player != null && target.team != Vars.player.team()) return;
@@ -121,13 +131,15 @@ public class BoostOverlay implements BuildingBoostSystem.VisualRenderer {
         float x = target.x - blockSize / 2f + size / 2f;
         float y = target.y - blockSize / 2f + size / 2f;
 
-        // 按「光标到按钮中心距离」动态淡入：超出淡出距离直接不渲染（自然也不可点击）
+        // 按「光标到按钮中心距离」动态淡入（分段）：超出淡出距离直接不渲染（自然也不可点击）
         float dist = Mathf.dst(Core.input.mouseWorldX(), Core.input.mouseWorldY(), x, y);
         if (dist >= fadeDistance) {
             return;
         }
-        // 该距离内线性变化：贴到按钮上 → maxAlpha，接近淡出距离 → 0
-        float alpha = maxAlpha * (1f - dist / fadeDistance);
+        // 近段（≤ nearDistance）取满不透明度；远段在其余距离上线性降到 0
+        float alpha = dist <= nearDistance
+            ? maxAlpha
+            : maxAlpha * (1f - (dist - nearDistance) / (fadeDistance - nearDistance));
 
         // 记录命中区（点击测试用）：与视觉尺寸一致（4×4px），故可见即可点。
         // 槽位用本帧游标分配，**不能用 index**（index 是 boost 在目标身上的序号，恒为 0，
@@ -193,12 +205,14 @@ public class BoostOverlay implements BuildingBoostSystem.VisualRenderer {
         if (boosts.isEmpty()) return;
 
         // 内容：每个生效 boost 一行，行格式由 bundle 管理（名称青色 + 全角冒号分隔）
+        // 用 name(target)/description(target) 而非无参版：多档位效果（节能/超频）据此
+        // 只报「名称+档位」与「该档的加成」，不会把三档全列出来
         StringBuilder content = new StringBuilder();
         for (BuildingBoostSystem.Boost boost : boosts) {
             if (content.length() > 0) {
                 content.append('\n');
             }
-            content.append(Core.bundle.format(lineKey, boost.name(), boost.description()));
+            content.append(Core.bundle.format(lineKey, boost.name(target), boost.description(target)));
         }
 
         // 标题用本地化 key + {0} 占位符注入方块名（方块名以 [accent] 强调）

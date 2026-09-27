@@ -13,7 +13,16 @@
 | 提供方 | 效率控制塔（`docs/blocks/EfficiencyControlTower.md`），需切到「超频」模式 |
 
 超频：作用对象与 [`EnergySavingBoost`](EnergySavingBoost.md) **完全一致**（耗电工厂），
-但方向相反——纯粹的「以机器寿命换产能」。
+但方向相反——纯粹的「以机器寿命换产能」。共 **3 个档位**（由效率控制塔的档位决定）。
+
+| 档位 | 生产效率 | 耗电 | 掉血 |
+|------|---------|------|------|
+| 1 级 | +50% | +30% | −4 生命/秒 |
+| 2 级 | +100% | +125% | −10 生命/秒 |
+| 3 级 | +300% | +500% | −45 生命/秒 |
+
+> 「生产效率」与「耗电」互相独立（前者走建筑 `efficiency`、后者走电网请求电量），
+> 故 3 级是「生产 4.0×、耗电 6.0×」两个不同比例。
 
 ## 目标过滤
 
@@ -26,23 +35,55 @@
 
 ## 子效果
 
-### 生产速度 +50%
+### 生产效率（按档位）
 
-`speedScale = 1.5f`。与节能同一入口：经 `BlockConsumerHooks.SpeedTaxConsume` 把该建筑的
-`efficiency` 抬到 1.5，生产进度 `progress += (1/craftTime) × efficiency × delta()` 随之等比变快。
+`speedScales = {1.5f, 2.0f, 4.0f}`（索引 0 = 1 级）。
 
-### 耗电 +75%
+**不能靠 `efficiency` 提速**（引擎硬限制）：
 
-`powerScale = 1.75f`。经 `BlockConsumerHooks.ScaledConsumePower` 把 `requestedPower(build)` 乘 1.75，
-只提高该建筑自己的请求电量（`PowerGraph.getPowerNeeded` 汇总时生效）。
+```java
+// Building.updateConsumption()
+float min = 1f;                                              // ← 初值就是 1
+for (非可选 consumer) min = Math.min(min, c.efficiency(build));
+efficiency = min;                                            // ← 故 efficiency 恒 ≤ 1
+```
 
-### 每 3 秒扣 10 点生命
+给 `efficiency` 返回 1.5 / 2.0 / 4.0 会被其他 consumer（物品/液体充足时返回 1.0）取小顶掉，
+**完全不起作用**（这正是「超频不加速、节能却正常」的原因——节能的 0.85 是**小于** 1 才生效）。
 
-`damage = 10f` / `damageInterval = 3f`。
+故改为**注入进度**（`BlockConsumerHooks.boostProgress`）：
+
+```java
+crafter.progress += crafter.getProgressIncrease(craftTime) * (factor - 1f);
+```
+
+- 引擎每 tick 做 `progress += getProgressIncrease(craftTime)`，这里追加「超出 1 倍的那一份」，
+  两者相加即得 `factor` 倍推进速度。
+- 取的是**同一个** `getProgressIncrease(craftTime)` 调用，故与引擎实际推进量完全一致
+  （含 `GenericCrafterBuild` 对液体产出空间的额外处理）。
+- `progress` 是**归一化**的（满 1 产出一次，`craft()` 内 `progress %= 1` 保留余量），
+  故多注入的量会正常参与取模结转，不会丢失或溢出。
+- 注入与引擎自增的先后只影响本 tick 内 `craft()` 触发的那一次，不影响每 tick 总推进量。
+- `progress` 是同步字段（服务器权威），两端注入相同量，瞬时差异会被同步抹平。
+
+### 耗电（按档位）
+
+`powerScales = {1.3f, 2.25f, 6.0f}`（索引 0 = 1 级）。经 `BlockConsumerHooks.ScaledConsumePower` 把
+`requestedPower(build)` 乘档位倍率，只提高该建筑自己的请求电量（`PowerGraph.getPowerNeeded` 汇总时生效）。
+
+### 持续掉血（按档位，单位：生命/秒）
+
+`damageRates = {4f, 10f, 45f}`，`damageInterval = 1f`（扣血周期，秒）。
 
 - **注入式**：`apply()` 每 tick 调用一次，按 tick 累计真实时间
-  （`Time.delta / 60f` 折算为秒，与注入器耗油口径一致），跨过间隔即扣血并保留余量（避免长期漂移）。
-- 走引擎标准伤害链路 `target.damage(damage)`，因此：
+  （`Time.delta / 60f` 折算为秒，与注入器耗油口径一致）；每跨过一个周期扣一次
+  **「速率 × 周期」**点生命，并保留余量以免长期漂移。
+  故周期为 1s 时，3 档即每 1 秒扣 4 / 10 / 45 点。
+- **档位由效果自己取**：`apply()` 内调 `BuildingBoostSystem.levelOf(target, id())`——
+  档位不由本单例持有（多台塔会互相覆盖），需按目标回查其提供者。
+- **离散扣除而非逐 tick 连续扣**：为保留原版受击反馈。`Building.damage` 会刷新 `hitTime`，
+  若每 tick 都扣，建筑会常驻受击色（看起来像一直在被攻击，而不是「在超频运转」）。
+- 走引擎标准伤害链路 `target.damage(点血量)`，因此：
   - 自动计入 `Rules.blockHealth(team)`（规则可调的伤害系数）；
   - 血量归零时由引擎触发 `Call.buildDestroyed` → **正常爆炸拆除**（两端都正确：
     `Call.buildDestroyed` 在客户端走本地销毁、服务端额外广播）；
@@ -78,8 +119,8 @@
 | 方法 | 内容 | 来源 |
 |------|------|------|
 | `name()` | `超频` / `Overclock` | bundle `boost.overclock.name` |
-| `description()` | `+50% 生产速度；+75% 电力消耗；每 3 秒 -10 生命` | bundle `boost.overclock.desc` |
-| `visual(Building)` | 原版状态图标 `StatusEffects.overdrive.uiIcon` | 强化按钮图标（底色 `Pal.lightFlame` 火焰橙） |
+| `description()` | 逐档一行：`{0}级：生产 {1}，耗电 {2}，-{3} 生命/秒` | bundle `boost.overclock.level`（由 `description()` 按倍率表拼装，非单行 key） |
+| `visual(Building)` | **统一图标** `BuildingBoostSystem.badgeIcon()` | 强化徽记（底色 `Pal.lightFlame` 火焰橙） |
 
 > 按钮**如何绘制**（位置/尺寸/按光标距离淡入/点击命中）与点击后**投递什么格式的消息**，
 > 由 `BuildingBoostSystem` 与 `silicon.util.BoostOverlay` 负责，见 `docs/utils/BuildingBoostSystem.md`。
@@ -104,16 +145,16 @@
   **电力条**显示的是供电满足度 `power.status`，均不受倍率影响。即超频在面板上不可见，
   只能通过电网负载与产出速率观察（掉血则直接可见）。
 - 掉血会**摧毁**工厂：血量归零即正常爆炸，可能连带损毁同格其他建筑——这是「以寿命换产能」的预期代价。
-  若不希望它停机，把 `OverclockBoost.instance.damage` 设为 0 即可（代码已判 `damage <= 0`）。
+  若不希望它停机，把 `OverclockBoost.instance.damageRates` 全部设为 0 即可（代码已判速率 ≤0 跳过）。
 
 ## 配置参数
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `speedScale` | float | `1.5f` | 生产速率倍率（1.5 = +50%） |
-| `powerScale` | float | `1.75f` | 电力需求倍率（1.75 = +75%） |
-| `damage` | float | `10f` | 每次扣血量（生命值），≤0 则关闭扣血 |
-| `damageInterval` | float | `3f` | 扣血间隔（秒），≤0 则关闭扣血 |
+| `speedScales` | float[] | `{1.5f, 2.0f, 4.0f}` | 各档生产效率倍率（索引 0 = 1 级），经**注入进度**实现（`efficiency` 恒 ≤ 1，不能用于提速） |
+| `powerScales` | float[] | `{1.3f, 2.25f, 6.0f}` | 各档耗电倍率（索引 0 = 1 级） |
+| `damageRates` | float[] | `{4f, 10f, 45f}` | 各档掉血**速率**（生命/秒，索引 0 = 1 级） |
+| `damageInterval` | float | `1f` | 扣血周期（秒）：每隔这么久扣一次「速率 × 周期」点生命；≤0 关闭扣血 |
 
 倍率与扣血字段均为 `OverclockBoost.instance` 上的 public 字段，实时读取，可直接改。
 
@@ -122,4 +163,6 @@
 | 版本 | 变更 |
 |------|------|
 | a0.x | 初始实现：耗电工厂获得生产 +50% / 耗电 +75%（经 `BlockConsumerHooks`，与节能共用钩子）+ 每 3 秒扣 10 生命（注入式，`ObjectMap` 逐建筑计时，`remove()` 清理）；与节能互斥；图标 `StatusEffects.overdrive`、底色 `Pal.lightFlame` |
+| a0.x | **改为 3 档制 + 掉血改为速率语义**：`speedScales {1.5, 2.0, 4.0}` / `powerScales {1.3, 2.25, 6.0}` / `damageRates {4, 10, 45}`（生命/秒），`damageInterval` 改为 1s（周期 × 速率 = 每次扣血量）。档位由 Provider 持有、System 按目标回查；`FactorSource` 改为接收档位参数，`description()` 逐档拼装（bundle `boost.overclock.level`） |
+| a0.x | **修复「超频不加速」**：`efficiency` 恒 ≤ 1（`updateConsumption` 取非可选 consumer 最小值且初值为 1），故把倍率返回给 `SpeedTaxConsume` 对 >1 的档位<b>完全无效</b>——被物品/液体 consumer 的 1.0 取小顶掉（节能的 0.85 因小于 1 才正常）。改为 `BlockConsumerHooks.boostProgress`：向 `progress` 追加「超出 1 倍的那一份」（`progress` 归一化，`craft()` 内 `% 1` 结转，故不会溢出）。`SpeedTaxConsume.efficiency` 同时把倍率夹到 ≤ 1，使该限制在代码里显式可见 |
 | a0.x | 互斥裁决沿用「优先级 + 效果 id 字典序」（恒为节能胜出），未采用「先放置者胜」 |

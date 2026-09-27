@@ -2,7 +2,6 @@ package silicon.util.boosts;
 
 import arc.Core;
 import arc.graphics.Color;
-import mindustry.content.StatusEffects;
 import mindustry.gen.Building;
 import mindustry.graphics.Pal;
 import mindustry.world.Block;
@@ -37,11 +36,17 @@ public class EnergySavingBoost implements BuildingBoostSystem.Boost, BlockConsum
         BlockConsumerHooks.register(instance);
     }
 
-    /** 电力倍率：0.8 = 电力消耗 −20%。 */
-    public float powerScale = 0.8f;
+    /**
+     * 电力倍率档位表（索引 0 = 1 级）：0.80 = −20%、0.60 = −40%、0.30 = −70%。
+     * 数值越小越省电，生产速率随之下降（见 {@link #speedScales}）。
+     */
+    public float[] powerScales = {0.80f, 0.60f, 0.30f};
 
-    /** 生产速率倍率：0.9 = 生产速度 −10%。 */
-    public float speedScale = 0.9f;
+    /**
+     * 生产速率倍率档位表（索引 0 = 1 级）：0.85 = −15%、0.70 = −30%、0.50 = −50%。
+     * 「生产效率」在本引擎中的实现即建筑 {@code efficiency}（见类注释）。
+     */
+    public float[] speedScales = {0.85f, 0.70f, 0.50f};
 
     @Override
     public String id(){
@@ -53,10 +58,46 @@ public class EnergySavingBoost implements BuildingBoostSystem.Boost, BlockConsum
         return Core.bundle.get("boost.energy_saving.name", "Energy Saving");
     }
 
+    /** 某档的显示名（含档位号），如「2级节能」。 */
+    public String name(int level){
+        return Core.bundle.format("boost.energy_saving.levelName", Math.max(1, level));
+    }
+
+    // 目标上的显示名：带其实际生效档位，供消息/面板逐建筑展示
+    @Override
+    public String name(Building target){
+        int level = BuildingBoostSystem.levelOf(target, id());
+        return level > 0 ? name(level) : name();
+    }
+
+    // 目标上的显示描述：只给当前生效档的加成（不列全部三档）
+    @Override
+    public String description(Building target){
+        int level = BuildingBoostSystem.levelOf(target, id());
+        return level > 0 ? summary(level) : description();
+    }
+
     @Override
     public String description(){
-        // 描述需与实际生效值一致：电力 −20%、生产速度 −10%
-        return Core.bundle.get("boost.energy_saving.desc", "-20% power consumption; -10% production speed");
+        // 描述须与实际生效值一致。此效果有 3 档，逐档列出（实际生效档由 System 按提供者决定）
+        StringBuilder sb = new StringBuilder();
+        for(int i = 0; i < powerScales.length; i++){
+            if(i > 0) sb.append('\n');
+            sb.append(Core.bundle.format("boost.energy_saving.line", i + 1, summary(i + 1)));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 某一档的加成摘要（单行、不含档位号），供 Provider 的配置面板显示。
+     * 与 {@link #description()} 共用同一份数值与文案，避免两处各写一遍而不同步。
+     *
+     * @param level 档位（自 1 起；越界夹到最近合法档）
+     */
+    public String summary(int level){
+        int i = BuildingBoostSystem.levelIndex(level, powerScales.length);
+        return Core.bundle.format("boost.energy_saving.bonus",
+            BuildingBoostSystem.percentText(1f - powerScales[i]), BuildingBoostSystem.percentText(1f - speedScales[i]));
     }
 
     // 目标过滤：耗电工厂。consPower != null 即「该方块类型登记了电力 consumer」（PowerGraph 汇总需求时只认它），
@@ -97,15 +138,16 @@ public class EnergySavingBoost implements BuildingBoostSystem.Boost, BlockConsum
     }
 
     // —— FactorSource：仅在本效果于该建筑上生效时被调用，故无需再判生效状态 ——
+    // level 由钩子按建筑回查（Provider 持有档位，见 BuildingBoostSystem#levelOf）
 
     @Override
-    public float powerFactor(Building build){
-        return powerScale;
+    public float powerFactor(Building build, int level){
+        return powerScales[BuildingBoostSystem.levelIndex(level, powerScales.length)];
     }
 
     @Override
-    public float speedFactor(Building build){
-        return speedScale;
+    public float speedFactor(Building build, int level){
+        return speedScales[BuildingBoostSystem.levelIndex(level, speedScales.length)];
     }
 
     /**
@@ -117,7 +159,7 @@ public class EnergySavingBoost implements BuildingBoostSystem.Boost, BlockConsum
 
         @Override
         public arc.graphics.g2d.TextureRegion icon(Building target){
-            return StatusEffects.slow.uiIcon;
+            return BuildingBoostSystem.badgeIcon();   // 统一图标，见 BuildingBoostSystem.badgeIcon()
         }
 
         @Override

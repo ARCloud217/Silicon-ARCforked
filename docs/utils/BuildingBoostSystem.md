@@ -39,6 +39,8 @@
 | `remove(target)` | 撤销（失格/被顶替/目标失效时一次） |
 | `priority()` | 互斥优先级，数值大者胜，默认 0 |
 | `conflictsWith(otherId)` | 互斥声明：与指定效果是否冲突。冲突裁决**同级按效果 id 字典序**（纯函数、与放置顺序无关，两端必然一致） |
+| `name()` / `description()` | 显示名 / 描述（无目标）。多档位效果的 `description()` 返回**全部档位**作参考 |
+| `name(target)` / `description(target)` | **带目标**的显示名 / 描述（默认同上）。多档位效果**应覆写**：`name(target)` 报「名称+档位」、`description(target)` 只报**当前生效档**的加成。UI（消息/面板）一律用这两个 |
 | `visual(target)` | 视觉描述（可空，返回 `BoostVisual`） |
 
 `apply` 的两种实现语义（实现自选，保持统一）：
@@ -54,8 +56,10 @@
 |------|------|
 | `building()` | 自身建筑实体 |
 | `targets()` | 候选目标集合（默认 `proximity`）；返回 `Seq` 供零分配遍历。强化器可**前置过滤**——非可用对象（如非炮塔）不进 System 循环 |
-| `boosts()` | 本强化器提供的效果列表（返回 `Seq`；实现方宜缓存复用该 Seq，避免每帧新建） |
-| `canTarget(target)` | 自身附加过滤（默认全放行，如「存油才提供」） |
+| `boosts()` | 本强化器提供的效果列表（返回 `Seq`；实现方宜缓存复用该 Seq，避免每帧新建）。**必须恒定返回完整列表**——条件用 `provides()` 表达，否则未列出的效果其旧贡献永不撤销 |
+| `provides(boost)` | **逐效果开关**（默认恒为是）。模式/档位类条件写这里——`canTarget` 拿不到「当前是哪个效果」，无法表达「不同模式提供不同效果」。返回 false 即触发该效果的正规撤销路径 |
+| `canTarget(target)` | 自身附加过滤（默认全放行，如「本机是否开机」「存油才提供」）。逐效果的条件请用 `provides()` |
+| `levelOf(boost)` | 本机为该效果提供的**档位**（默认 0 = 不适用）。供「同一效果多强度档」：效果是单例、档位不能存实例字段（多台塔会互相覆盖），故由 Provider 持有，System 按目标回查（`levelOf(target, boostId)`）后向其索取。正数 = 有效档位（自 1 起） |
 | `updateBoosts()` | 接入 System 驱动，Build 的 `update()` 末尾调用 |
 | `removeProviderBoosts()` | 在 Build 的 `onRemoved()` 里调用，让 System 撤销本强化器提供的一切强化 |
 
@@ -64,8 +68,11 @@
 - `Boost` 通过 `visual()` 告诉 System「显示什么」（描述对象）；
 - `BoostVisual` 目前提供三个字段方法：
   - `type()` 视觉类型标识（渲染管线分发用，未定型）；
-  - `icon(target)` **强化图标**（`TextureRegion`）——建议直接取用**原版图集资源**以贴合游戏风格
-    （如 `StatusEffects.overclock.uiIcon`），null 则不绘制；
+  - `icon(target)` **强化图标**（`TextureRegion`）。**当前全项目统一用一张**：
+    `BuildingBoostSystem.badgeIcon()`（原版「超频」状态图标 `StatusEffects.overclock.uiIcon`）——
+    徽记表达的是「这座建筑身上有强化生效」，而非「生效的是哪一个效果」（具体哪个效果、哪一档由点击后的
+    消息面板逐行列出）。**换图标只改 `badgeIcon()` 一处**。返回 null 时 `BoostOverlay` 会回落到该统一图标，
+    故「只要有任意强化生效就一定看得到徽记」；
   - `color()` 徽记配色（用作底板色，**null 时渲染器用默认 `Pal.accent`**）；
 - System 经可插拔的 `visualRenderer`（`VisualRenderer` 接口）在 `drawBoosts()` 里统一调度绘制：
   `render(target, visual, index)`——`index` 为该 boost 在目标身上的序号（0 起），供多个徽记排开；
@@ -73,14 +80,22 @@
   挂 `Trigger.draw` → `drawBoosts()`，绘制与交互规则：
   - **强化信息按钮**：只要目标身上有任意一个生效的 boost，就在方块左下角渲染一个**可点击按钮**；
     固定 **0.5 格（4×4px）**，锚在 footprint 左下角那一格内侧（紧贴角、不越出方块）；
+  - **消息内容按「每个生效效果一行」**渲染，行格式 `boost.info.line` = `[cyan]{名称}[]：{加成}`，
+    用的是 **`Boost.name(target)` / `Boost.description(target)`**（带目标的重载）：
+    多档位效果据此**只报「名称+档位」与「该档的加成」**，不会把三档全列出来。
+    例：`2级超频：+100% 生产效率，+125% 电力消耗，-10 生命/秒`。
+    无参的 `name()` / `description()` 拿不到目标，故返回通用名与**全部档位**（供文档/调试参考）。
   - **按钮外观**：统一色 `#99cc3366` 底板（与消息气泡同色）+ 亮色细白边 + 原版图标（占内框 80%）。
     - 注：arc 的 `Draw.rect(region,x,y,w,h,float)` 第 6 参是**旋转角**而非描边宽度，故白边用
       「先铺略大白色矩形、再叠内缩的彩色矩形」的内嵌法实现（**勿**用 rect 的第 6 参当线宽，
       否则会画出整块不透明白色把底色盖住）；
-  - **按光标距离动态淡入**（取代原悬停高亮/放大）：
-    - 不透明度 = `maxAlpha(0.4) × (1 − dist / fadeDistance)`，`dist` 为光标世界坐标到按钮中心的距离；
-    - `dist ≥ fadeDistance`（3 格 = 24px）时**整颗按钮与图标都不渲染**，自然也不可点击；
-    - 整个按钮（白边 + 底板 + 图标）统一按该不透明度绘制，贴到按钮上时取上限 **40%**；
+  - **按光标距离动态淡入（分段，取代原悬停高亮/放大）**：不透明度取「光标到按钮中心距离」的
+    **分段线性**值（`dist` 为光标世界坐标到按钮中心的距离）：
+    - `dist ≤ nearDistance`（**2 格 = 16px**）→ 恒为上限 **80%**（近段平台，不渐变）；
+    - `2 ~ 10 格`（`[nearDistance, fadeDistance]`）→ 由 80% **线性衰减**到 0，
+      即 `maxAlpha × (1 − (dist − nearDistance) / (fadeDistance − nearDistance))`；
+    - `dist ≥ fadeDistance`（**10 格 = 80px**）→ **整颗按钮与图标都不渲染**，自然也不可点击；
+    - 整个按钮（白边 + 底板 + 图标）统一按该不透明度绘制；
   - **多个效果合并为一个按钮**（只画第一个），各自详情在消息面板里列出；
   - **点击行为**：向消息面板（`MessageSystem`）投递一条 **10s 时限**消息——
     气泡色 `#99cc3366`（`background()` 同时用作消失时间覆盖层色）；
@@ -148,7 +163,7 @@
 | 互斥 | 效果数 ≤ 1 走快速路径，跳过排序与临时 Seq/Map |
 | 迭代 | `ObjectMap`/`ObjectSet` 一律「先收集再删除」（`keys()` 依赖内部数组，边遍历边 remove 会抛并发修改异常）；用可复用缓冲中转 |
 | Provider 侧 | `targets()`/`boosts()` 返回 `Seq` 走下标遍历；实现方应缓存复用（注入器按 tick 重建并复用炮塔缓存，扣油阶段共用同一份） |
-| 渲染 | `BoostOverlay` 每帧只算一次视野矩形；按钮 4px 固定故不会超出方块轮廓；按光标距离淡入，超出 3 格不渲染（同时省去绘制）；命中区按索引复用；无面板 UI（详情走消息面板，零 UI 开销） |
+| 渲染 | `BoostOverlay` 每帧只算一次视野矩形；按钮 4px 固定故不会超出方块轮廓；按光标距离**分段**淡入（≤2 格恒 80%，2~10 格线性降到 0，超出 10 格不渲染，同时省去绘制）；命中区按索引复用；无面板 UI（详情走消息面板，零 UI 开销） |
 
 ## 多人 / 队伍安全
 
@@ -182,12 +197,16 @@
 | `sameTeam(Building, Building)` | 同队判定 |
 | `get(id)` | 注册表按 id 取效果 |
 | `register(Boost)` | 自动注册效果（加载期调用，重复 id 覆盖） |
+| `levelIndex(level, length)` | 档位（自 1 起）→ 倍率表下标，越界夹到最近合法档。**保证返回值合法**，故查倍率表时无需判空 |
+| `percentText(ratio)` | 倍率 → 百分比文本（`0.2f` → `"-20%"`），供加成文案统一格式化 |
 | `activeBoosts(target)` | 查目标当前生效的**效果单元列表**（`Seq<Boost>`，每次新建，**仅供点击/开面板等低频路径**，勿放每帧循环） |
 | `hasActiveBoosts(target)` | 目标是否还有生效强化（零分配，供每帧轮询） |
 | `isActive(target, boostId)` | 指定效果当前是否生效（零分配 O(1)）。**供「引擎钩子」在被引擎回调时查询自身倍率**——钩子不能缓存每建筑状态（缓存会产生两端不同步窗口） |
+| `levelOf(target, boostId)` | 该效果在目标上的**档位**（0 = 无有效提供者）。**供「同一效果多强度档」**（如效率控制塔 1~3 级节能/超频）：效果实现是**单例**、档位不能存实例字段（多台塔会互相覆盖），故档位由 Provider 持有、按目标回查。多个提供者时取**建筑 id 最小**者（与互斥裁决同口径、两端一致）。零分配 |
 | `isProviderOf(target, provider, id)` | 提供归属：本强化器是否当前有效提供者（读 `contributors`，两端一致，**可安全用于**耗网络化资源决策） |
 | `updateBoosts(provider)` | 每帧驱动入口（兼触发每 tick 统一冲洗） |
 | `removeProvider(provider)` | 移除强化器并即时重算受影响目标（`onRemoved` 钩子 / 清扫兜底） |
+| `badgeIcon()` | **强化徽记的统一图标**（`TextureRegion`）。全项目只有这一张，各 `Boost.visual()` 均取此处；要换图标只改这一处 |
 | `drawBoosts()` | 渲染管线每帧调用，调度视觉 |
 
 ## 使用示例
@@ -296,3 +315,7 @@ System 撤销某个 Provider 贡献的**唯一**路径是：该 Provider 仍被 
 | a0.x | 新增钩子式效果范式与 `isActive(target, boostId)`（零分配 O(1)）：供效果在「引擎钩子被回调时」查询自身生效状态。新增首个钩子式效果 `EnergySavingBoost`（`docs/boosts/EnergySavingBoost.md`）+ 通用钩子工具 `BlockConsumerHooks`；新增「1b. 钩子式效果」示例章节 |
 | a0.x | 名单 `boostableTypes` 追加工厂 `GenericCrafterBuild`（原仅炮塔）；新增「⚠ Provider 作者必读：想让效果停掉时只能靠 `canTarget()`」——记录撤销贡献的唯一路径（`boosts()`/`targets()` 恒定返回完整集合，条件只判 `canTarget`），避免开关类 Provider 出现贡献永不撤销的卡死 |
 | a0.x | 互斥裁决**保持**「优先级 + 效果 id 字典序」的纯函数排序键（曾短暂试过按提供者建筑 id 实现「先放置者胜」，已撤回）：字典序两端必然一致，且结果与放置顺序/玩家操作时序无关，不会因「谁先放」而改变；例：节能(`energy_saving`) 与 超频(`overclock`) 冲突时恒为节能胜出 |
+| a0.x | 新增「档位」范式：`Provider.levelOf(Boost)` + `BuildingBoostSystem.levelOf(target, boostId)`（零分配，多提供者取建筑 id 最小者）。供「同一效果多强度档」——效果实现是单例，档位存实例字段会被多台提供者互相覆盖，故档位由 Provider 持有、按目标回查。`BlockConsumerHooks.FactorSource` 的倍率方法改为接收档位参数 |
+| a0.x | **强化徽记图标统一**：新增 `silicon.util.boosts.BoostBadge.icon()` 作为唯一图标来源（原版「超频」状态图标），三个效果的 `visual()` 全部改用它，换图标只需改一处。徽记语义收敛为「该建筑有强化生效」，具体效果/档位由点击后的消息面板逐行列出。`BoostOverlay.render` 增加回落：`visual()` 或其 `icon()` 为 null 时用统一图标兜底，保证「有强化必显徽记」 |
+| a0.x | 合并小工具类进 System：原独立的 `boosts.BoostBadge` / `boosts.BoostText` 迁入本类，成为 `BuildingBoostSystem.badgeIcon()` / `levelIndex(level, length)` / `percentText(ratio)`，两个文件删除（`boosts` 包只剩 `BlockConsumerHooks` 与三个效果实现） |
+| a0.x | 徽记淡入改为**分段**：≤2 格恒定 80%（`maxAlpha` 0.4→0.8，新增 `nearDistance` = 2 格）、2~10 格线性衰减到 0（`fadeDistance` 3 格→10 格）、超出 10 格不渲染 |

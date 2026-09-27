@@ -68,7 +68,7 @@
 |------|------|------|
 | `name()` | `润滑油` / `Lubricant` | bundle `boost.lubricant.name` |
 | `description()` | `+100% 旋转速度；+20% 攻击速度` | bundle `boost.lubricant.desc` |
-| `visual(Building)` | 原版状态图标 `StatusEffects.overclock.uiIcon` | 强化按钮图标（底板色 null → 渲染器默认） |
+| `visual(Building)` | **统一图标** `BuildingBoostSystem.badgeIcon()` | 强化徽记（底板色 null → 渲染器默认） |
 | `color()` | 不覆写 | 渲染器默认色 |
 
 > 按钮**如何绘制**（位置/尺寸/按光标距离淡入/点击命中）与点击后**向消息面板投递什么格式**，

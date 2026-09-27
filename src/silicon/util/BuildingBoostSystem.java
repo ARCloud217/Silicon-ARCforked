@@ -6,6 +6,7 @@ import arc.struct.ObjectMap;
 import arc.struct.ObjectSet;
 import arc.struct.Seq;
 import mindustry.Vars;
+import mindustry.content.StatusEffects;
 import mindustry.gen.Building;
 import mindustry.world.blocks.defense.turrets.Turret;
 import mindustry.world.blocks.production.GenericCrafter;
@@ -152,8 +153,30 @@ public final class BuildingBoostSystem {
          * 简要强化描述（本地化）：一句话说明本效果带来的收益，如
          * 「+100% 旋转速度；+20% 攻击速度」。用于强化面板展示，<b>每个 Boost 必须给出</b>。
          * 实现建议走 bundle 归类管理；数值应与实际生效值一致。
+         *
+         * <p>注意：<b>「全部档位」还是「当前档位」由实现自行决定</b>——本方法拿不到目标，
+         * 故多档位效果通常返回全部档位作参考，而 UI 展示应改用
+         * {@link #description(Building)}（只给当前生效的那一档）。
          */
         String description();
+
+        /**
+         * 目标上的显示名称（本地化）：默认同 {@link #name()}。
+         * <b>多档位效果应覆写</b>为「名称 + 档位」（如「2级超频」），
+         * 供消息/面板逐建筑展示——本方法拿得到目标，故能报出该建筑实际生效的档位。
+         */
+        default String name(Building target) {
+            return name();
+        }
+
+        /**
+         * 目标上的显示描述（本地化）：默认同 {@link #description()}。
+         * <b>多档位效果应覆写</b>为<b>仅当前生效档</b>的加成（如「+100% 生产效率，+125% 电力消耗，-10 生命/秒」），
+         * 避免把三档全列出来。档位经 {@link #levelOf(Building, String)} 取得。
+         */
+        default String description(Building target) {
+            return description();
+        }
 
         /**
          * 目标过滤：System 在登记贡献前读取本方法，控制本效果能否作用于该目标
@@ -245,6 +268,21 @@ public final class BuildingBoostSystem {
          */
         default boolean canTarget(Building target) {
             return true;
+        }
+
+        /**
+         * 本机为<b>该效果</b>提供的<b>档位</b>（默认 0 = 无档位/不适用）。
+         *
+         * <p>供「同一效果有多个强度档」的场景（如效率控制塔的 1~3 级节能/超频）：
+         * 效果实现通常是<b>单例</b>，无法把档位存成实例字段（多台塔会互相覆盖），
+         * 故档位由 Provider 持有，System 按目标查出其提供者后再向其索取。
+         *
+         * <p>取值约定：<b>正数</b>表示有效档位（自 1 起），0 表示不提供此效果。
+         * 同一目标有多个提供者时，{@link #levelOf(Building, String)} 取<b>建筑 id 最小</b>者的档位，
+         * 与互斥裁决同口径（确定性、两端一致）。
+         */
+        default int levelOf(Boost boost) {
+            return 0;
         }
 
         /** update() 里调用即可接入 System 的驱动循环。 */
@@ -367,6 +405,87 @@ public final class BuildingBoostSystem {
     public static boolean isActive(Building target, String boostId){
         ObjectMap<String, Boolean> map = active.get(target);
         return map != null && Boolean.TRUE.equals(map.get(boostId));
+    }
+
+    /**
+     * 查询该效果在目标上的<b>档位</b>（0 = 无有效提供者/效果不适用）。
+     *
+     * <p>供「引擎钩子」与效果自身取当前档位：效果实现是<b>单例</b>，档位不能存成实例字段
+     * （多台 Provider 会互相覆盖），必须按目标回查其提供者。
+     *
+     * <p>多个提供者时取<b>建筑 id 最小</b>者的档位（建筑 id 由服务器按放置顺序分配并同步，
+     * 两端一致），与互斥裁决的「最早提供者胜」同口径。
+     *
+     * <p>零分配。返回值仅在对应效果当前生效时才有意义（调用方通常先判 {@link #isActive}）。
+     *
+     * @param boostId 效果 id（见 {@link Boost#id()}）
+     */
+    public static int levelOf(Building target, String boostId) {
+        Boost boost = registry.get(boostId);
+        if (boost == null) {
+            return 0;
+        }
+        ObjectMap<String, ObjectSet<Provider>> tmap = contributors.get(target);
+        ObjectSet<Provider> set = tmap == null ? null : tmap.get(boostId);
+        if (set == null || set.isEmpty()) {
+            return 0;
+        }
+        Provider best = null;
+        int bestId = Integer.MAX_VALUE;
+        for (Provider provider : set) {
+            Building b = provider.building();
+            if (b != null && b.id < bestId) {
+                bestId = b.id;
+                best = provider;
+            }
+        }
+        return best == null ? 0 : best.levelOf(boost);
+    }
+
+    // —— 档位化效果的共用工具（倍率表按档位索引、展示文案）——
+
+    /**
+     * 档位（自 1 起）→ 倍率表下标，越界时落到最近的合法档。
+     *
+     * <p>供「同一效果多强度档」的 {@link Boost} 查自己的倍率表。返回值保证落在
+     * {@code [0, length-1]}，故<b>调用方无需判空</b>：档位为 0（无提供者/不适用）
+     * 或表被配错时表现为「按 1 级生效」——属可接受的降级，好过数组越界崩游戏。
+     */
+    public static int levelIndex(int level, int length) {
+        if (length <= 0) {
+            return 0;
+        }
+        return Math.max(0, Math.min(length - 1, level - 1));
+    }
+
+    /**
+     * 倍率 → 百分比文本：{@code 0.2f} → {@code "-20%"}，{@code -0.5f} → {@code "+50%"}。
+     * 用于强化详情/配置面板的加成文案，避免各效果各写一遍格式化。
+     */
+    public static String percentText(float ratio) {
+        int v = Math.round(ratio * 100f);
+        String sign = v > 0 ? "-" : v < 0 ? "+" : "";
+        return sign + Math.abs(v) + "%";
+    }
+
+    // —— 强化徽记 ——
+
+    /**
+     * 强化徽记的<b>统一图标</b>（{@link TextureRegion}）。
+     *
+     * <p><b>全项目只有这一张</b>：徽记表达的是「这座建筑身上有强化生效」，
+     * <b>不是</b>「生效的是哪一个效果」——具体是哪个效果、哪一档，由点击徽记后的消息面板逐行列出。
+     * 徽记若每个效果各用一张图标，同一座建筑上会出现语义重叠的多种标识
+     * （且原版状态图标与「建筑被强化」并无一一对应关系），反而增加噪音。
+     *
+     * <p>要换图标<b>只改这一处</b>即可全局生效（各效果的 {@link Boost#visual(Building)} 都从这里取，
+     * {@link BoostOverlay} 在其返回 null 时也回落到这里）。
+     *
+     * <p>当前用原版「超频」（overclock）状态图标——它本身就是游戏里表示「获得增益」的通用符号，
+     * 且为游戏自带美术，风格与 UI 统一。
+     */
+    public static TextureRegion badgeIcon() {
+        return StatusEffects.overclock.uiIcon;
     }
 
     /**

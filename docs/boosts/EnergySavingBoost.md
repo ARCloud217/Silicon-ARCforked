@@ -12,7 +12,16 @@
 | 单例 | `EnergySavingBoost.instance`（静态块自动 `register` 进 System） |
 | 提供方 | 效率控制塔（`docs/blocks/EfficiencyControlTower.md`），需在配置面板切到「节能」模式 |
 
-节能：**耗电工厂**同时获得 **电力消耗 −20%** 与 **生产速度 −10%** 的两个子效果。
+节能：**耗电工厂**同时获得**耗电下降**与**生产效率下降**两个子效果，共 **3 个档位**（由效率控制塔的档位决定）。
+
+| 档位 | 耗电 | 生产效率 |
+|------|------|---------|
+| 1 级 | −20% | −15% |
+| 2 级 | −40% | −30% |
+| 3 级 | −70% | −50% |
+
+> 两个子效果**互相独立**：耗电在电网请求电量处缩放，生产效率在建筑自身 `efficiency` 处缩放。
+> 故 3 级是「耗电 0.30×、生产 0.50×」，不是同一比例。
 
 ## 目标过滤
 
@@ -29,20 +38,27 @@
 
 ## 子效果
 
-### 电力消耗 −20%
+### 耗电（按档位）
 
-`powerScale = 0.8f`。
+`powerScales = {0.80f, 0.60f, 0.30f}`（索引 0 = 1 级）。
 
 引擎侧电力需求按 `Σ block.consPower.requestedPower(build) × build.delta()` 汇总（`PowerGraph.getPowerNeeded`），
 故覆写 `requestedPower(Building)` 即可得到**每建筑独立**的电力倍率。
 
-### 生产速度 −10%
+### 生产效率（按档位）
 
-`speedScale = 0.9f`。
+`speedScales = {0.85f, 0.70f, 0.50f}`（索引 0 = 1 级）。
 
 生产进度按 `progress += (1 / craftTime) × edelta()` 累加，而 `edelta = efficiency × delta()`；
 `efficiency` 由 `Building.updateConsumption()` 取所有**非可选** consumer 的 `efficiency(build)` 最小值（初值 1）。
-故注册一个返回 `0.9` 的「速率税」consumer → `efficiency = 0.9` → 生产速率 ×0.9。
+故注册一个返回档位倍率的「速率税」consumer → `efficiency` 被压到该倍率 → 生产速率等比变化。
+
+### 档位从哪来
+
+**档位不由本单例持有**（多台塔会互相覆盖），而是由 Provider（效率控制塔）持有：
+引擎钩子被查询时先取 `BuildingBoostSystem.isActive(build, id())` 判断生效，
+再取 `BuildingBoostSystem.levelOf(build, id())` 拿到档位（1~3），据此索引上面的倍率表。
+因同队两塔范围不得重叠，一台工厂的档位本就唯一。
 
 ## 为什么用钩子而不是直接改字段
 
@@ -55,11 +71,14 @@ MJ 里工厂的电力与速率**都不是每建筑可写字段**：
 
 故只能用引擎留给「按建筑个体」的两个 consumer 扩展点（详见 `BlockConsumerHooks` 类注释）：
 
-- `BlockConsumerHooks.ScaledConsumePower` —— 包装原电力 consumer，覆写 `requestedPower(Building)`；
+- `BlockConsumerHooks.SpeedTaxConsume` —— 参与 `efficiency` 取最小值，把该建筑的 `efficiency` 压到档位倍率（0.85 / 0.70 / 0.50）。
+  **该入口只能降、不能升**：`Building.updateConsumption()` 取最小值的初值就是 1，故 `efficiency` 恒 ≤ 1
+  （返回 1.5 会被物品/液体 consumer 的 1.0 顶掉）。因此节能用它、超频的提速必须另用
+  `BlockConsumerHooks.boostProgress` 注入进度——见 `OverclockBoost.md`。
 - `BlockConsumerHooks.SpeedTaxConsume` —— 参与 `efficiency` 最小值，把速率压到 0.9。
 
 **两个子效果互不干扰**：电力需求只乘 `delta()`、**不乘** `efficiency`；生产速率两者都乘。
-故「降电力 0.8」与「降速率 0.9」可各自独立取值，**无需任何系数换算**。
+两个子效果互不干扰（电力需求只乘 `delta()`、**不乘** `efficiency`；生产速率两者都乘）。故「降电力」与「降速率」可以各自独立取值，**无需任何系数换算**——这正是 3 级能取 0.30× 与 0.50× 两个不同比例的前提。
 
 ## 生命周期语义
 
@@ -87,8 +106,8 @@ MJ 里工厂的电力与速率**都不是每建筑可写字段**：
 | 方法 | 内容 | 来源 |
 |------|------|------|
 | `name()` | `节能` / `Energy Saving` | bundle `boost.energy_saving.name` |
-| `description()` | `-20% 电力消耗；-10% 生产速度` | bundle `boost.energy_saving.desc` |
-| `visual(Building)` | 原版状态图标 `StatusEffects.slow.uiIcon` | 强化按钮图标（底色 `Pal.powerLight` 电量蓝，区别于润滑油的默认绿） |
+| `description()` | 逐档一行：`{0}级：耗电 {1}，生产 {2}` | bundle `boost.energy_saving.level`（由 `description()` 按倍率表拼装，非单行 key） |
+| `visual(Building)` | **统一图标** `BuildingBoostSystem.badgeIcon()` | 强化徽记（底色 `Pal.powerLight` 电量蓝，区别于润滑油的默认绿） |
 
 > 按钮**如何绘制**（位置/尺寸/按光标距离淡入/点击命中）与点击后**投递什么格式的消息**，
 > 由 `BuildingBoostSystem` 与 `silicon.util.BoostOverlay` 负责，见 `docs/utils/BuildingBoostSystem.md`。
@@ -106,7 +125,7 @@ MJ 里工厂的电力与速率**都不是每建筑可写字段**：
 
 ## 已知副作用
 
-- `efficiency` 被压到 0.9 是**总标量**，故凡依赖它的判定都等比变化（生产进度、`optionalEfficiency`、
+- `efficiency` 被压到档位倍率（0.85 / 0.70 / 0.50）是**总标量**，故凡依赖它的判定都等比变化（生产进度、`optionalEfficiency`、依赖 `efficiency > 0` 的产出节流）——这正是「生产效率下降」的期望语义。**该入口无法提速**（`efficiency` 恒 ≤ 1），故节能方向天然适配。
   依赖 `efficiency > 0` 的产出节流）——这正是「生产速度 −10%」的期望语义。
 - 方块面板的**耗电量**显示读的是钩子镜像的原值 `usage`（故仍显示标称值），
   **电力条**显示的是供电满足度 `power.status`，均不受倍率影响。
@@ -116,11 +135,11 @@ MJ 里工厂的电力与速率**都不是每建筑可写字段**：
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `powerScale` | float | `0.8f` | 电力需求倍率（0.8 = −20%） |
-| `speedScale` | float | `0.9f` | 生产速率倍率（0.9 = −10%） |
+| `powerScales` | float[] | `{0.80f, 0.60f, 0.30f}` | 各档耗电倍率（索引 0 = 1 级） |
+| `speedScales` | float[] | `{0.85f, 0.70f, 0.50f}` | 各档生产效率倍率（索引 0 = 1 级） |
 
 两者均为 `EnergySavingBoost.instance` 上的 public 字段，钩子每次查询时实时读取，可直接改：
-`EnergySavingBoost.instance.speedScale = 0.95f;`
+`EnergySavingBoost.instance.speedScales[0] = 0.9f;`  // 改 1 级
 
 ## 现状
 
@@ -138,3 +157,4 @@ MJ 里工厂的电力与速率**都不是每建筑可写字段**：
 | 版本 | 变更 |
 |------|------|
 | a0.x | 初始实现：耗电工厂（`consPower != null` 且 `GenericCrafter`）获得电力 −20% / 生产速度 −10%；经 `BlockConsumerHooks` 两个 consumer 钩子实现（替换式安装、幂等自愈、`remove` 无需还原）；图标 `StatusEffects.slow`、底色 `Pal.powerLight` |
+| a0.x | **改为 3 档制**（由效率控制塔档位驱动）：`powerScales {0.80, 0.60, 0.30}` / `speedScales {0.85, 0.70, 0.50}`，即 1 级 −20%/−15%、2 级 −40%/−30%、3 级 −70%/−50%。`FactorSource` 改为接收档位参数（档位由 Provider 持有、System 按目标回查，因效果是单例不能存实例字段）；`description()` 改为按倍率表逐档拼装（bundle `boost.energy_saving.level`） |

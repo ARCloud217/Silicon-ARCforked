@@ -2,7 +2,6 @@ package silicon.util.boosts;
 
 import arc.Core;
 import arc.math.Angles;
-import mindustry.content.StatusEffects;
 import mindustry.gen.Building;
 import mindustry.world.blocks.defense.turrets.BaseTurret;
 import mindustry.world.blocks.defense.turrets.Turret;
@@ -110,14 +109,13 @@ public class LubricantBoost implements BuildingBoostSystem.Boost {
         return LubricantVisual.instance;
     }
 
-    /** 视觉描述：受惠炮塔左下角显示原版「超频」状态图标（overclock），底板用游戏强调色 Pal.accent。 */
-    private static class LubricantVisual implements BuildingBoostSystem.BoostVisual {
+    /** 视觉描述：强化徽记（统一图标，底板用渲染器默认色）。 */
+    private static class LubricantVisual implements BuildingBoostSystem.BoostVisual{
         static final LubricantVisual instance = new LubricantVisual();
 
         @Override
-        public arc.graphics.g2d.TextureRegion icon(Building target) {
-            // 原版状态图标：攻速增益语义一致，且是游戏自带美术，风格统一
-            return StatusEffects.overclock.uiIcon;
+        public arc.graphics.g2d.TextureRegion icon(Building target){
+            return BuildingBoostSystem.badgeIcon();   // 统一图标，见 BuildingBoostSystem.badgeIcon()
         }
 
         // 底板色交由渲染器默认（Pal.accent 绿），此处不覆写

@@ -4,17 +4,18 @@ import arc.Core;
 import arc.graphics.Color;
 import arc.graphics.g2d.Draw;
 import arc.graphics.g2d.Fill;
-import arc.graphics.g2d.Lines;
 import arc.math.Mathf;
 import arc.scene.ui.Label;
 import arc.scene.ui.layout.Table;
 import arc.struct.Seq;
+import arc.util.Align;
 import arc.util.io.Reads;
 import arc.util.io.Writes;
 import mindustry.Vars;
 import mindustry.game.Team;
 import mindustry.gen.Building;
 import mindustry.gen.Tex;
+import mindustry.graphics.Drawf;
 import mindustry.graphics.Pal;
 import mindustry.ui.Styles;
 import mindustry.world.Block;
@@ -27,17 +28,23 @@ import static mindustry.Vars.tilesize;
 
 /**
  * 效率控制塔：3x3 支援方块（{@link BuildingBoostSystem.Provider}）。以塔为中心、{@code 15×15} 格
- * 的方形区域内，<b>消耗电力的己方工厂</b>按模式附上对应强化：
+ * 的方形区域内，<b>消耗电力的己方工厂</b>按档位附上对应强化：
  *
  * <ul>
- *   <li><b>关闭</b>：不提供任何强化；</li>
- *   <li><b>节能</b>（{@link EnergySavingBoost}）：电力 −20%、生产速度 −10%；</li>
- *   <li><b>超频</b>（{@link OverclockBoost}）：生产速度 +50%、耗电 +75%，且<b>每 3 秒扣 10 点生命</b>
- *       （血量归零即正常爆炸拆除）。</li>
+ *   <li><b>关闭</b>（0，默认）：不提供任何强化；</li>
+ *   <li><b>节能</b>（−1 ~ −3）：附上 {@link EnergySavingBoost}，逐档递增省电与减产；</li>
+ *   <li><b>超频</b>（+1 ~ +3）：附上 {@link OverclockBoost}，逐档递增加速与耗电，并<b>持续扣血</b>。</li>
  * </ul>
  *
- * <p>模式由配置面板的滑块切换（走标准 {@code Call.tileConfig} 链路，联网全端一致，
- * 存盘经 {@code write}/{@code read} 持久化）。
+ * <p>档位由配置面板的<b>单个滑块</b>切换，范围 {@code [-3, +3]}、步长 1，故自左至右为
+ * 「3级节能 → 2级 → 1级 → <b>关闭</b> → 1级超频 → 2级 → 3级」——关闭恰在正中。
+ * 走标准 {@code Call.tileConfig} 链路，联网全端一致，存盘经 {@code write}/{@code read} 持久化。
+ *
+ * <p><b>档位由本塔持有、不存在效果单例里</b>：两个效果实现都是单例（倍率表在其中），
+ * 若把档位存成实例字段，多台塔会互相覆盖。故档位经 {@link #levelOf(BuildingBoostSystem.Boost)}
+ * 由本 Provider 提供，System/引擎钩子按目标回查（{@link BuildingBoostSystem#levelOf}）。
+ * 由于同队两塔范围不得重叠（见下），一台工厂的档位本就唯一，回查最多命中一个提供者。
+ *
  *
  * <p><b>关键实现约束：{@code boosts()} 与模式无关，永远返回完整效果列表。</b>
  * System 撤销某 Provider 贡献的唯一路径是「该 Provider 仍被遍历到、但对某个 boost id 的意愿为 false」
@@ -69,13 +76,24 @@ public class EfficiencyControlTower extends Block{
         // 模式经标准 config 链路同步（客户端 configure → Call.tileConfig → 两端 configured → 本处理器）
         config(Integer.class, (EfficiencyControlTowerBuild b, Integer value) -> {
             if(value != null){
-                b.mode = Mathf.clamp(value, 0, EfficiencyControlTowerBuild.maxMode);
+                b.mode = Mathf.clamp(value, -EfficiencyControlTowerBuild.maxLevel,
+                    EfficiencyControlTowerBuild.maxLevel);
             }
         });
     }
 
     /** 影响区域边长（格）：以本方块中心为中心的正方形区域。 */
     public float range = 15f;
+
+    /**
+     * 范围预览色（随模式）：关闭=淡灰、节能=绿、超频=红。
+     * 供放置预览与选中时共用，保证「看到的颜色」与「当前模式」一致。
+     */
+    public static Color modeColor(int mode){
+        if(mode < 0) return Pal.accent;   // 节能：绿
+        if(mode > 0) return Pal.remove;   // 超频：红
+        return Color.lightGray;           // 关闭：淡灰
+    }
 
     /** 区域半边长（像素）：range 为奇数时中心恰好落在中间一格上。 */
     public float halfRangePx(){
@@ -90,15 +108,17 @@ public class EfficiencyControlTower extends Block{
     /**
      * 由「放置锚点格坐标」求本方块实例的几何中心（像素）。
      *
-     * <p>放置预览与放置校验都用它，保证「看到的范围」「校验的范围」「建成后实际生效的范围」三者同口径。
-     * 运行期则直接用建筑自身的 {@code x}/{@code y}（引擎写入，几何中心）。
+     * <p>口径与引擎一致：建筑位置 = {@code tile.worldx() + block.offset}（原版
+     * {@code UnitAssembler.canPlaceOn} 等亦用此式；{@code Block.offset = ((size+1)%2)*8/2f}，
+     * 3x3 为 0）。放置预览、放置校验都用它，保证「看到的范围」「校验的范围」
+     * 「建成后实际生效的范围」三者同口径——早前按「锚点 + 1 格 + 半格」算会使预览向右上偏 12px。
      */
     public float centerX(int tileX){
-        return tileX * tilesize + (size - 1) / 2f * tilesize + tilesize / 2f;
+        return tileX * tilesize + offset;
     }
 
     public float centerY(int tileY){
-        return tileY * tilesize + (size - 1) / 2f * tilesize + tilesize / 2f;
+        return tileY * tilesize + offset;
     }
 
     /**
@@ -143,57 +163,77 @@ public class EfficiencyControlTower extends Block{
         return conflict[0];
     }
 
-    /** 放置预览：画出影响区域（与选中时同口径）；与同队塔重叠时画红色。 */
+    /**
+     * 放置预览：影响区域着色；与同队塔范围重叠（或本身不可放置）时改为红色 + 红色提示文字。
+     *
+     * <p>预览色按<b>新塔的默认模式</b>（关闭 = 淡灰）绘制：模式是<b>每建筑</b>的配置，
+     * 放置前并不存在（玩家从建造菜单拿到的永远是默认「关闭」），故预览只能是淡灰；
+     * 选中已建成的塔时才显示其真实模式色（见 {@code drawSelect}）。
+     *
+     * <p>提示文字走原版 {@link #drawPlaceText(String, int, int, boolean)}（与钻头显示
+     * 「挖掘速率」用的是同一个入口），传 {@code valid = false} 即以 {@link Pal#remove} 红色渲染。
+     */
     @Override
     public void drawPlace(int x, int y, int rotation, boolean valid){
         super.drawPlace(x, y, rotation, valid);
 
         float cx = centerX(x), cy = centerY(y);
-        boolean free = valid && !rangeConflicts(cx, cy, Vars.player.team(), null);
-        if(!free){
-            drawArea(cx, cy, halfRangePx(), Pal.remove, 0.1f, 0.7f);
+        if(valid && !rangeConflicts(cx, cy, Vars.player.team(), null)){
+            drawArea(cx, cy, halfRangePx(), modeColor(EfficiencyControlTowerBuild.modeOff), 0.08f);
             return;
         }
-        drawArea(cx, cy, halfRangePx(), Pal.placing, 0.08f, 0.4f);
+
+        // 范围重叠（或本身不可放置）：红框 + 红色说明文字
+        drawArea(cx, cy, halfRangePx(), Pal.remove, 0.1f);
+        drawPlaceText(Core.bundle.get("block.silicon-efficiency-control-tower.rangeConflict"), x, y, false);
     }
 
     /**
-     * 画出影响区域：半透明填充 + 描边。
+     * 画出影响区域：半透明填充 + <b>原版风格虚线框</b>。
      *
      * <p><b>arc 的两个 API 锚点不一致，务必注意</b>：
      * <ul>
      *   <li>{@code Fill.rect}（经 {@code Draw.rect} → {@code Batch.draw(x - w/2, y - h/2, ...)}）
      *       是<b>中心锚点</b>；</li>
-     *   <li>{@code Lines.rect(x, y, w, h)}（6 参重载按 center=(0,0) 换算）是<b>左下角锚点</b>。</li>
+     *   <li>{@code Drawf.dashRect(color, x, y, w, h)}（首条线段为 {@code (x,y) → (x+w,y)}）
+     *       是<b>左下角锚点</b>。</li>
      * </ul>
      * 两者传同一组坐标必然错位，故这里分别按各自锚点换算——否则会出现「填充对了边框错 /
      * 边框对了填充错」的反复现象。
+     *
+     * <p>虚线框与原版放置预览（电力桥/钻头/传送带）一致，用 {@link Drawf#dashRect}。
+     * <b>注意 {@code Drawf} 的两个硬编码</b>：它内部会 {@code Lines.stroke(3f)}（线宽固定 3，
+     * 外部设线宽无效）且用 {@code Pal.gray} 的 RGB —— 传入的 {@link Color} <b>只有 alpha 生效</b>。
+     * 故虚线框恒为<b>不透明</b>的灰色（与原版一致，alpha 固定 1），状态区分靠<b>填充色</b>与提示文字承担。
      */
-    public static void drawArea(float cx, float cy, float half, Color color, float fillAlpha, float lineAlpha){
+    public static void drawArea(float cx, float cy, float half, Color color, float fillAlpha){
         float size = half * 2f;
-        // 填充：中心锚点，直接传中心
+
+        // 填充：中心锚点，直接传中心（颜色与透明度完全生效）
         Draw.color(color, fillAlpha);
         Fill.rect(cx, cy, size, size);
-        // 描边：左下角锚点，须减去半边长
-        Draw.color(color, lineAlpha);
-        Lines.stroke(1f);
-        Lines.rect(cx - half, cy - half, size, size);
+
+        // 描边：左下角锚点 + 原版虚线，**不透明**。
+        // dashRect 只取传入 Color 的 alpha（RGB 被内部固定为 Pal.gray），故显式置 alpha = 1。
+        Color border = color.cpy();
+        border.a = 1f;
+        Drawf.dashRect(border, cx - half, cy - half, size, size);
+
         Draw.reset();
     }
 
     public class EfficiencyControlTowerBuild extends Building implements BuildingBoostSystem.Provider{
 
-        /** 模式：关闭。 */
+        /** 模式：关闭（默认值）。 */
         public static final int modeOff = 0;
-        /** 模式：节能（区域内耗电工厂附上 EnergySavingBoost）。 */
-        public static final int modeEnergySaving = 1;
-        /** 模式：超频（区域内耗电工厂附上 OverclockBoost：更快、更耗电、持续掉血）。 */
-        public static final int modeOverclock = 2;
+        /** 最高档位（节能/超频各 3 级）。滑块范围为 {@code [-maxLevel, +maxLevel]}。 */
+        public static final int maxLevel = 3;
 
-        /** 模式上界（滑块最大档）。 */
-        public static final int maxMode = modeOverclock;
-
-        /** 当前模式（0=关闭 / 1=节能 / 2=超频）。经 config 链路同步、经 write/read 持久化。 */
+        /**
+         * 当前模式：<b>负数 = 节能，0 = 关闭，正数 = 超频</b>，绝对值即档位（1~3）。
+         * 滑块自左至右为「3级节能 → 2级 → 1级 → 关闭 → 1级超频 → 2级 → 3级」，
+         * 故「关闭」恰在正中（7 个档位的第 4 格）。
+         */
         int mode = modeOff;
 
         /** 区域内耗电建筑缓存：按 tick 重建并复用同一 Seq（零分配）。 */
@@ -221,7 +261,7 @@ public class EfficiencyControlTower extends Block{
         // 且范围与其他同队塔重叠时（conflicted）一律不提供——放置校验之外的兜底（旧存档/强制放置）。
         @Override
         public boolean provides(BuildingBoostSystem.Boost boost){
-            return !conflicted && mode == modeOf(boost.id());
+            return !conflicted && levelOf(boost) > 0;
         }
 
         // 本机是否开机（粗筛，逐效果的模式判断在 provides）
@@ -230,12 +270,21 @@ public class EfficiencyControlTower extends Block{
             return enabled;
         }
 
-        /** 该效果 id 对应的模式档位。 */
-        private int modeOf(String boostId){
-            if(boostId == null) return modeOff;
-            if(EnergySavingBoost.instance.id().equals(boostId)) return modeEnergySaving;
-            if(OverclockBoost.instance.id().equals(boostId)) return modeOverclock;
-            return modeOff;
+        /**
+         * 本机为该效果提供的档位：节能取 {@code -mode}、超频取 {@code mode}，关闭/越界为 0。
+         * 档位由本 Provider 持有（效果是单例，不能存实例字段），System 按目标回查时向本方法索取。
+         */
+        @Override
+        public int levelOf(BuildingBoostSystem.Boost boost){
+            if(conflicted || boost == null) return 0;
+            String id = boost.id();
+            if(EnergySavingBoost.instance.id().equals(id)){
+                return mode < 0 ? Math.min(-mode, maxLevel) : 0;
+            }
+            if(OverclockBoost.instance.id().equals(id)){
+                return mode > 0 ? Math.min(mode, maxLevel) : 0;
+            }
+            return 0;
         }
 
         // 前置目标过滤：区域内「耗电」建筑才交给 System（非耗电对象不进 System 循环）
@@ -286,29 +335,73 @@ public class EfficiencyControlTower extends Block{
             updateBoosts();
         }
 
-        // —— 配置面板：模式滑块（关闭 / 节能 / 超频）——
+        // —— 配置面板：档位滑块（3级节能 | 关闭 | 3级超频）——
+
+        /**
+         * 配置面板固定宽度（px）。
+         *
+         * <p><b>必须固定</b>：若面板随内容宽度变化，滑块长度就会跟着变，
+         * 同一个像素位置在「关闭」与「1级节能」下可能对应不同档位，无法精确点选。
+         * 故所有单元格一律用 {@code defaults().width(uiWidth)} 锁死，
+         * 两行文本设 {@code wrap} 在该宽度内换行，绝不撑宽面板。
+         */
+        private static final float uiWidth = 320f;
 
         @Override
         public void buildConfiguration(Table table){
             table.top();
 
-            Table inner = new Table();
-            inner.background(Tex.pane);
-            inner.margin(8f, 10f, 8f, 10f);
-            table.add(inner).growX();
+            Table pane = new Table();
+            pane.background(Tex.pane);
+            pane.margin(10f);
+            pane.top();
+            pane.defaults().width(uiWidth).left();
+            table.add(pane).width(uiWidth).row();
 
-            Label value = new Label(Core.bundle.get(modeKey(mode)), Styles.defaultLabel);
-            value.setColor(Pal.accent);
+            // 标题
+            pane.add(Core.bundle.get("block.silicon-efficiency-control-tower.modeLabel"))
+                .color(Pal.accent).left().padBottom(2f).row();
 
-            inner.add(Core.bundle.get("block.silicon-efficiency-control-tower.modeLabel")).left().padRight(8f);
-            // 步长 1 的滑块 = 三个离散档位（0 关闭 / 1 节能 / 2 超频）
-            inner.slider(0f, maxMode, 1f, mode, v -> {
+            // 两行文本：先建好、滑块回调需要刷新它们，故用数组持有引用（加入表格的顺序在下面）
+            Label levelText = new Label(modeName(mode), Styles.defaultLabel);
+            levelText.setAlignment(Align.center);
+            levelText.setColor(modeColor(mode));
+            levelText.setWrap(true);
+
+            Label bonusText = new Label(bonusText(mode), Styles.defaultLabel);
+            bonusText.setAlignment(Align.center);
+            bonusText.setColor(Pal.accent);
+            bonusText.setWrap(true);
+
+            Label[] rows = {levelText, bonusText};
+
+            // 滑块：范围 [-3, +3]、步长 1 = 7 个离散档位，
+            // 自左至右 3级节能 → 2级 → 1级 → 关闭 → 1级超频 → 2级 → 3级（关闭恰在正中）
+            pane.slider(-maxLevel, maxLevel, 1f, mode, v -> {
                 int m = Mathf.round(v);
-                value.setText(Core.bundle.get(modeKey(m)));
+                rows[0].setText(modeName(m));
+                rows[0].setColor(modeColor(m));
+                rows[1].setText(bonusText(m));
                 configure(m);
-            }).growX().height(28f).padRight(8f);
-            inner.add(value).right();
-            inner.row();
+            }).height(28f).padBottom(2f).row();
+
+            // 当前档位（滑块下方）
+            pane.add(levelText).width(uiWidth).padBottom(2f).row();
+            // 当前档位的加成信息（文本下方）
+            pane.add(bonusText).width(uiWidth).row();
+        }
+
+        /**
+         * 当前档位的加成摘要：关闭 → 「无效果」；否则取对应效果的 {@code summary(level)}——
+         * 与强化详情面板用的是同一份数值与文案，不会两处不同步。
+         */
+        private String bonusText(int mode){
+            if(mode == 0 || mode > maxLevel || mode < -maxLevel){
+                return Core.bundle.get("block.silicon-efficiency-control-tower.bonus.off");
+            }
+            return mode < 0
+                ? EnergySavingBoost.instance.summary(-mode)
+                : OverclockBoost.instance.summary(mode);
         }
 
         @Override
@@ -325,26 +418,33 @@ public class EfficiencyControlTower extends Block{
         @Override
         public void read(Reads read, byte revision){
             super.read(read, revision);
-            mode = Mathf.clamp(read.s(), 0, maxMode);
+            mode = Mathf.clamp(read.s(), -maxLevel, maxLevel);
         }
 
-        // 选中时显示影响区域；与其他同队塔范围重叠（旧存档/强制放置）时画红色提示「本塔未运行」
+        // 选中时显示影响区域（虚线框）；与其他同队塔范围重叠（旧存档/强制放置）时画红色，提示本塔未运行
+        // 选中时显示影响区域（虚线框），颜色随模式；与其他同队塔范围重叠（旧存档/强制放置）时画红，提示本塔未运行
         @Override
         public void drawSelect(){
             super.drawSelect();
             if(conflicted){
-                drawArea(x, y, halfRangePx(), Pal.remove, 0.1f, 0.7f);
+                drawArea(x, y, halfRangePx(), Pal.remove, 0.1f);
             }else{
-                drawArea(x, y, halfRangePx(), Pal.accent, 0.08f, 0.4f);
+                drawArea(x, y, halfRangePx(), modeColor(mode), 0.08f);
             }
         }
 
-        private static String modeKey(int mode){
-            return switch(mode){
-                case modeEnergySaving -> "block.silicon-efficiency-control-tower.mode.energySaving";
-                case modeOverclock -> "block.silicon-efficiency-control-tower.mode.overclock";
-                default -> "block.silicon-efficiency-control-tower.mode.off";
-            };
+        /**
+         * 档位的显示文本：直接取<b>对应效果的档位名</b>（如「2级节能」），不另建一套 key——
+         * 单一数据源，改文案时配置面板与强化消息面板同步生效，不会两处不同步。
+         * 越界值回落到「关闭」。
+         */
+        private static String modeName(int mode){
+            if(mode == 0 || mode > maxLevel || mode < -maxLevel){
+                return Core.bundle.get("block.silicon-efficiency-control-tower.mode.off");
+            }
+            return mode < 0
+                ? EnergySavingBoost.instance.name(-mode)
+                : OverclockBoost.instance.name(mode);
         }
     }
 }

@@ -3,6 +3,7 @@ package silicon.util.boosts;
 import arc.struct.Seq;
 import mindustry.gen.Building;
 import mindustry.world.Block;
+import mindustry.world.blocks.production.GenericCrafter;
 import mindustry.world.consumers.Consume;
 import mindustry.world.consumers.ConsumePower;
 import silicon.util.BuildingBoostSystem;
@@ -21,8 +22,10 @@ import silicon.util.BuildingBoostSystem;
  *       引擎自带的 {@code ConsumePowerDynamic} / {@code ConsumePowerCondition} 也正是用这个方法做按建筑动态电量。</li>
  *   <li><b>生产速率</b>：{@code progress += (1 / craftTime) × edelta()}，而 {@code edelta = efficiency × delta()}；
  *       {@code efficiency} 由 {@code Building.updateConsumption()} 取所有<b>非可选</b> consumer 的
- *       {@code efficiency(build)} 的最小值得出（初值 1）。故塞一个返回 {@code 1.5} 的「速率税」consumer，
- *       即可让该建筑 {@code efficiency = 1.5} → 生产速率 ×1.5。</li>
+ *       {@code efficiency(build)} 最小值得出。<b>但该最小值的初值就是 1，故 {@code efficiency ≤ 1}——
+ *       只能用来「降速」</b>：塞一个返回 0.85 的「速率税」consumer 即可让生产速率 ×0.85；
+ *       而「提速到 1 倍以上」（超频）必须改用 {@link #boostProgress} 注入进度，
+ *       返回 1.5/2.0/4.0 给 efficiency 是<b>无效的</b>（会被其他 consumer 的 1.0 取小顶掉）。</li>
  * </ul>
  *
  * <p><b>两者互不干扰</b>：电力需求只乘 {@code delta()}、不乘 {@code efficiency}；
@@ -46,16 +49,20 @@ public class BlockConsumerHooks{
      * 参与「按建筑缩放」的效果源：钩子式效果实现本接口并在静态块 {@link #register} 一次。
      *
      * <p>倍率方法<b>只会在本效果于该建筑上生效时被调用</b>，故实现里无需再判生效状态。
+     *
+     * <p>{@code level} 是<b>当前档位</b>（自 1 起，见 {@link BuildingBoostSystem#levelOf}）：
+     * 效果实现通常是单例，无法把档位存成实例字段（多台提供者会互相覆盖），
+     * 故由钩子按建筑回查档位后传入，支持「同一效果多个强度档」。
      */
     public interface FactorSource{
         /** 效果 id（与 {@link BuildingBoostSystem.Boost#id()} 同一个方法，两边共用一份实现）。 */
         String id();
 
         /** 电力需求倍率（1 = 不影响）。 */
-        float powerFactor(Building target);
+        float powerFactor(Building target, int level);
 
         /** 生产速率倍率（1 = 不影响）。 */
-        float speedFactor(Building target);
+        float speedFactor(Building target, int level);
     }
 
     /** 已注册的倍率来源（加载期填充，运行期只读）。 */
@@ -78,8 +85,9 @@ public class BlockConsumerHooks{
         float factor = 1f;
         for(int i = 0, n = sources.size; i < n; i++){
             FactorSource source = sources.get(i);
-            if(BuildingBoostSystem.isActive(build, source.id())){
-                factor *= source.powerFactor(build);
+            String id = source.id();
+            if(BuildingBoostSystem.isActive(build, id)){
+                factor *= source.powerFactor(build, BuildingBoostSystem.levelOf(build, id));
             }
         }
         return factor;
@@ -90,8 +98,9 @@ public class BlockConsumerHooks{
         float factor = 1f;
         for(int i = 0, n = sources.size; i < n; i++){
             FactorSource source = sources.get(i);
-            if(BuildingBoostSystem.isActive(build, source.id())){
-                factor *= source.speedFactor(build);
+            String id = source.id();
+            if(BuildingBoostSystem.isActive(build, id)){
+                factor *= source.speedFactor(build, BuildingBoostSystem.levelOf(build, id));
             }
         }
         return factor;
@@ -184,18 +193,53 @@ public class BlockConsumerHooks{
 
     /**
      * 速率税：作为非可选 consumer 参与 {@code efficiency} 取最小值，
-     * 从而把该建筑的 {@code efficiency} 压到 {@link #speedFactor}，生产进度随之等比变化。
+     * 从而把该建筑的 {@code efficiency} 压到 {@link #speedFactor}，生产进度随之等比变慢。
+     *
+     * <p><b>只能降、不能升</b>（引擎硬限制）：{@code Building.updateConsumption()} 里
+     * <pre>float min = 1f;  // 初值即 1
+     * for (非可选 consumer) min = Math.min(min, c.efficiency(build));
+     * efficiency = min;</pre>
+     * 故 {@code efficiency} <b>恒 ≤ 1</b>：返回 1.5/2.0/4.0 会被其他 consumer（物品/液体充足时返回 1.0）
+     * 取小顶掉，<b>完全不起作用</b>。本方法因此把倍率夹到 {@code ≤ 1}，
+     * 「提高到 1 以上」的部分必须改用 {@link #boostProgress}。
      *
      * <p><b>副作用须知</b>：{@code efficiency} 是引擎「这座建筑跑多快」的总标量，
      * 故凡依赖它的判定（生产进度、{@code optionalEfficiency}、依赖 {@code efficiency > 0} 的
-     * 产出节流等）都会随之等比变化——这正是「生产速度 ±X%」的期望语义。
-     * 但它<b>不影响</b>方块信息面板的<b>耗电量</b>与<b>电力条</b>：
-     * 耗电读的是本钩子镜像的 {@code usage}（原值），电力条显示的是供电满足度 {@code power.status}。
+     * 产出节流等）都会随之等比变化。耗电读的是本钩子镜像的 {@code usage}（原值）、
+     * 电力条显示 {@code power.status}，均不受影响。
      */
     public static class SpeedTaxConsume extends Consume{
         @Override
         public float efficiency(Building build){
-            return speedFactor(build);
+            return Math.min(speedFactor(build), 1f);
         }
+    }
+
+    /**
+     * 生产速率「提高到 1 以上」的部分：向 {@code progress} 追加<b>超出 1 倍的那一份</b>。
+     *
+     * <p><b>为什么需要它</b>：见 {@link SpeedTaxConsume}——{@code efficiency} 恒 ≤ 1，
+     * 无法用来加速。故对 {@code factor > 1} 改用「注入进度」：
+     * 引擎每 tick 做 {@code progress += getProgressIncrease(craftTime)}，
+     * 这里追加 {@code 增量的 (factor - 1)} 倍，两端相加即得 {@code factor} 倍的推进速度。
+     *
+     * <p>取的是<b>同一个</b> {@code getProgressIncrease(craftTime)} 调用，故与引擎实际推进量完全一致
+     * （含 {@code GenericCrafterBuild} 对液体产出空间的额外处理）。
+     *
+     * <p>进度是归一化的（满 1 即产出一次，{@code craft()} 内 {@code progress %= 1} 保留余量），
+     * 故多注入的量会正常参与取模结转，不会丢失或溢出。
+     *
+     * <p>时机无关：{@code apply} 每 tick 一次，注入与引擎自增的先后只影响本 tick 内
+     * {@code craft()} 触发的那一次，不影响每 tick 总推进量。
+     *
+     * <p>{@code progress} 是同步字段（服务器权威），两端各自注入相同量，瞬时差异会被同步抹平。
+     */
+    public static void boostProgress(Building build, float factor){
+        if(factor <= 1f || !(build instanceof GenericCrafter.GenericCrafterBuild)){
+            return;
+        }
+        GenericCrafter.GenericCrafterBuild crafter = (GenericCrafter.GenericCrafterBuild)build;
+        float craftTime = ((GenericCrafter)crafter.block).craftTime;
+        crafter.progress += crafter.getProgressIncrease(craftTime) * (factor - 1f);
     }
 }

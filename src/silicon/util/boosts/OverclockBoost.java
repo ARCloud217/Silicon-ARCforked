@@ -4,7 +4,6 @@ import arc.Core;
 import arc.graphics.Color;
 import arc.struct.ObjectMap;
 import arc.util.Time;
-import mindustry.content.StatusEffects;
 import mindustry.gen.Building;
 import mindustry.graphics.Pal;
 import mindustry.world.Block;
@@ -16,10 +15,11 @@ import silicon.util.BuildingBoostSystem;
  * 但方向相反，是纯粹的「以机器寿命换产能」：
  *
  * <ul>
- *   <li><b>生产速度 +50%</b>：与节能同一入口——经 {@link BlockConsumerHooks.SpeedTaxConsume}
- *       把 {@code efficiency} 抬到 1.5，生产进度随之等比变快；</li>
- *   <li><b>耗电 +75%</b>：经 {@link BlockConsumerHooks.ScaledConsumePower} 把
- *       {@code requestedPower(build)} 乘 1.75，只提高该建筑自己的请求电量；</li>
+ *   <li><b>生产速度 +50% / +100% / +300%</b>：<b>不能</b>靠 {@code efficiency}——引擎取所有非可选
+ *       consumer 的最小值且初值即 1，故 {@code efficiency ≤ 1}，提速无效；改为经
+ *       {@link BlockConsumerHooks#boostProgress} 向 {@code progress} 追加「超出 1 倍的那一份」；</li>
+ *   <li><b>耗电 +30% / +125% / +500%</b>：经 {@link BlockConsumerHooks.ScaledConsumePower} 把
+ *       {@code requestedPower(build)} 乘档位倍率，只提高该建筑自己的请求电量；</li>
  *   <li><b>每 3 秒扣 10 点生命</b>：注入式，按 tick 累计真实时间，跨过间隔即
  *       {@code target.damage(damage)}（走引擎标准伤害链路，含 {@code Rules.blockHealth} 与
  *       {@code Call.buildDestroyed}），血量归零即正常爆炸拆除。</li>
@@ -47,17 +47,25 @@ public class OverclockBoost implements BuildingBoostSystem.Boost, BlockConsumerH
     /** id 常量：供「节能」侧对称声明互斥，避免两处字面量写错。 */
     public static final String id_const = "overclock";
 
-    /** 生产速率倍率：1.5 = 生产速度 +50%。 */
-    public float speedScale = 1.5f;
+    /**
+     * 生产速率倍率档位表（索引 0 = 1 级）：1.5 = +50%、2.0 = +100%、4.0 = +300%。
+     * 「生产效率」在本引擎中的实现即建筑 {@code efficiency}（见类注释）。
+     */
+    public float[] speedScales = {1.5f, 2.0f, 4.0f};
 
-    /** 电力倍率：1.75 = 耗电 +75%。 */
-    public float powerScale = 1.75f;
+    /**
+     * 电力倍率档位表（索引 0 = 1 级）：1.3 = +30%、2.25 = +125%、6.0 = +500%。
+     */
+    public float[] powerScales = {1.3f, 2.25f, 6.0f};
 
-    /** 每次扣血量（生命值）。 */
-    public float damage = 10f;
+    /**
+     * 掉血速率档位表（索引 0 = 1 级，单位：生命/秒）：4 / 10 / 45。
+     * 以 {@link #damageInterval} 秒为周期离散扣除（见 {@link #tickDamage}），故实际扣血量 = 速率 × 周期。
+     */
+    public float[] damageRates = {4f, 10f, 45f};
 
-    /** 扣血间隔（秒）。 */
-    public float damageInterval = 3f;
+    /** 扣血周期（秒）：每隔这么久扣一次「速率 × 周期」点生命。 */
+    public float damageInterval = 1f;
 
     /** 每建筑累计的扣血计时（秒）。在 remove() 中清理，见类注释。 */
     private static final ObjectMap<Building, Float> damageTimers = new ObjectMap<>();
@@ -72,11 +80,47 @@ public class OverclockBoost implements BuildingBoostSystem.Boost, BlockConsumerH
         return Core.bundle.get("boost.overclock.name", "Overclock");
     }
 
+    /** 某档的显示名（含档位号），如「2级超频」。 */
+    public String name(int level){
+        return Core.bundle.format("boost.overclock.levelName", Math.max(1, level));
+    }
+
+    // 目标上的显示名：带其实际生效档位，供消息/面板逐建筑展示
+    @Override
+    public String name(Building target){
+        int level = BuildingBoostSystem.levelOf(target, id());
+        return level > 0 ? name(level) : name();
+    }
+
+    // 目标上的显示描述：只给当前生效档的加成（不列全部三档）
+    @Override
+    public String description(Building target){
+        int level = BuildingBoostSystem.levelOf(target, id());
+        return level > 0 ? summary(level) : description();
+    }
+
     @Override
     public String description(){
-        // 描述需与实际生效值一致：生产 +50%、耗电 +75%、每 3 秒 -10 生命
-        return Core.bundle.get("boost.overclock.desc",
-            "+50% production speed; +75% power consumption; -10 HP every 3s");
+        // 描述须与实际生效值一致；逐档列出（实际生效档由 System 按提供者决定）
+        StringBuilder sb = new StringBuilder();
+        for(int i = 0; i < speedScales.length; i++){
+            if(i > 0) sb.append('\n');
+            sb.append(Core.bundle.format("boost.overclock.line", i + 1, summary(i + 1)));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 某一档的加成摘要（单行、不含档位号），供 Provider 的配置面板显示。
+     * 与 {@link #description()} 共用同一份数值与文案，避免两处各写一遍而不同步。
+     *
+     * @param level 档位（自 1 起；越界夹到最近合法档）
+     */
+    public String summary(int level){
+        int i = BuildingBoostSystem.levelIndex(level, speedScales.length);
+        return Core.bundle.format("boost.overclock.bonus",
+            BuildingBoostSystem.percentText(speedScales[i] - 1f), BuildingBoostSystem.percentText(powerScales[i] - 1f),
+            (int)damageRates[i]);
     }
 
     // 目标过滤与节能完全一致：耗电工厂（consPower != null 且 GenericCrafter）
@@ -97,7 +141,15 @@ public class OverclockBoost implements BuildingBoostSystem.Boost, BlockConsumerH
         // 惰性安装引擎钩子（与节能共用同一对钩子，无需重复安装）
         BlockConsumerHooks.install(target.block);
 
-        tickDamage(target);
+        // 档位由 System 按目标回查（Provider 持有档位）——本效果是单例，不能存实例字段
+        int level = BuildingBoostSystem.levelOf(target, id());
+        if(level <= 0) return;
+
+        // 提速：efficiency 恒 ≤ 1（引擎取最小值、初值即 1），无法用来加速，
+        // 故按档位向 progress 追加「超出 1 倍的那一份」。见 BlockConsumerHooks#boostProgress。
+        BlockConsumerHooks.boostProgress(target, speedScales[BuildingBoostSystem.levelIndex(level, speedScales.length)]);
+
+        tickDamage(target, damageRates[BuildingBoostSystem.levelIndex(level, damageRates.length)]);
     }
 
     @Override
@@ -118,24 +170,27 @@ public class OverclockBoost implements BuildingBoostSystem.Boost, BlockConsumerH
     }
 
     // —— FactorSource：仅在本效果于该建筑上生效时被调用 ——
+    // level 由钩子按建筑回查（Provider 持有档位，见 BuildingBoostSystem#levelOf）
 
     @Override
-    public float powerFactor(Building build){
-        return powerScale;
+    public float powerFactor(Building build, int level){
+        return powerScales[BuildingBoostSystem.levelIndex(level, powerScales.length)];
     }
 
     @Override
-    public float speedFactor(Building build){
-        return speedScale;
+    public float speedFactor(Building build, int level){
+        return speedScales[BuildingBoostSystem.levelIndex(level, speedScales.length)];
     }
 
     /**
      * 扣血计时：{@code apply} 每 tick 调用一次，故按 tick 累计真实秒数
      * （{@code Time.delta} 每 tick ≈ 1，{@code /60} 折算为秒，与注入器的耗油口径一致）。
-     * 跨过间隔即扣一次血，并保留余量以免长期漂移。
+     * 每跨过 {@link #damageInterval} 秒扣一次「{@code ratePerSec × 间隔}」点生命，
+     * 并保留余量以免长期漂移。离散扣除（而非逐 tick 连续扣）是为了保留原版受击反馈
+     * （{@code Building.damage} 会刷新 {@code hitTime}，逐 tick 扣会让建筑常驻受击色）。
      */
-    private void tickDamage(Building target){
-        if(damage <= 0f || damageInterval <= 0f) return;
+    private void tickDamage(Building target, float ratePerSec){
+        if(ratePerSec <= 0f || damageInterval <= 0f) return;
 
         float timer = damageTimers.get(target, 0f) + Time.delta / 60f;
         if(timer < damageInterval){
@@ -144,11 +199,11 @@ public class OverclockBoost implements BuildingBoostSystem.Boost, BlockConsumerH
         }
 
         damageTimers.put(target, timer - damageInterval);
-        target.damage(damage);
+        target.damage(ratePerSec * damageInterval);
     }
 
     /**
-     * 视觉描述：原版「超速」状态图标（overdrive）——「超频」语义贴合，火焰橙底板
+     * 视觉描述：强化徽记（<b>统一图标</b>，见 {@link BuildingBoostSystem#badgeIcon()}），底板取火焰橙
      * （{@link Pal#lightFlame}）表达过热风险，与节能的电量蓝、润滑油的默认绿区分开。
      */
     private static class OverclockVisual implements BuildingBoostSystem.BoostVisual{
@@ -156,7 +211,7 @@ public class OverclockBoost implements BuildingBoostSystem.Boost, BlockConsumerH
 
         @Override
         public arc.graphics.g2d.TextureRegion icon(Building target){
-            return StatusEffects.overdrive.uiIcon;
+            return BuildingBoostSystem.badgeIcon();   // 统一图标，见 BuildingBoostSystem.badgeIcon()
         }
 
         @Override
