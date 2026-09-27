@@ -105,7 +105,7 @@ public class OverclockBoost implements BuildingBoostSystem.Boost, BlockConsumerH
         StringBuilder sb = new StringBuilder();
         for(int i = 0; i < speedScales.length; i++){
             if(i > 0) sb.append('\n');
-            sb.append(Core.bundle.format("boost.overclock.line", i + 1, summary(i + 1)));
+            sb.append(Core.bundle.format("boost.overclock.line", name(i + 1), summary(i + 1)));
         }
         return sb.toString();
     }
@@ -147,9 +147,14 @@ public class OverclockBoost implements BuildingBoostSystem.Boost, BlockConsumerH
 
         // 提速：efficiency 恒 ≤ 1（引擎取最小值、初值即 1），无法用来加速，
         // 故按档位向 progress 追加「超出 1 倍的那一份」。见 BlockConsumerHooks#boostProgress。
-        BlockConsumerHooks.boostProgress(target, speedScales[BuildingBoostSystem.levelIndex(level, speedScales.length)]);
+        // 档位表被置空（异常配置）时按「不改变任何量」处理：既不提速也不掉血，而不是抛数组越界。
+        if(speedScales.length > 0){
+            BlockConsumerHooks.boostProgress(target, speedScales[BuildingBoostSystem.levelIndex(level, speedScales.length)]);
+        }
 
-        tickDamage(target, damageRates[BuildingBoostSystem.levelIndex(level, damageRates.length)]);
+        if(damageRates.length > 0){
+            tickDamage(target, damageRates[BuildingBoostSystem.levelIndex(level, damageRates.length)]);
+        }
     }
 
     @Override
@@ -174,12 +179,12 @@ public class OverclockBoost implements BuildingBoostSystem.Boost, BlockConsumerH
 
     @Override
     public float powerFactor(Building build, int level){
-        return powerScales[BuildingBoostSystem.levelIndex(level, powerScales.length)];
+        return BuildingBoostSystem.levelValue(powerScales, level);
     }
 
     @Override
     public float speedFactor(Building build, int level){
-        return speedScales[BuildingBoostSystem.levelIndex(level, speedScales.length)];
+        return BuildingBoostSystem.levelValue(speedScales, level);
     }
 
     /**

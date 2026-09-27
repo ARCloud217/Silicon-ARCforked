@@ -178,7 +178,10 @@ public class EfficiencyControlTower extends Block{
         super.drawPlace(x, y, rotation, valid);
 
         float cx = centerX(x), cy = centerY(y);
-        if(valid && !rangeConflicts(cx, cy, Vars.player.team(), null)){
+        // 无本地玩家（如专用服务器/无头渲染）时无从取队伍，退回按「可放置」显示，不做重叠判定
+        Team team = Vars.player == null ? null : Vars.player.team();
+        boolean free = valid && (team == null || !rangeConflicts(cx, cy, team, null));
+        if(free){
             drawArea(cx, cy, halfRangePx(), modeColor(EfficiencyControlTowerBuild.modeOff), 0.08f);
             return;
         }
@@ -362,46 +365,42 @@ public class EfficiencyControlTower extends Block{
             pane.add(Core.bundle.get("block.silicon-efficiency-control-tower.modeLabel"))
                 .color(Pal.accent).left().padBottom(2f).row();
 
-            // 两行文本：先建好、滑块回调需要刷新它们，故用数组持有引用（加入表格的顺序在下面）
-            Label levelText = new Label(modeName(mode), Styles.defaultLabel);
-            levelText.setAlignment(Align.center);
-            levelText.setColor(modeColor(mode));
-            levelText.setWrap(true);
+            // 档位说明：单行「{档位名}，{加成摘要}」，如「1级节能，-20%电力消耗，-15%生产效率」。
+            // 滑块回调需要刷新它，故先建好再用数组持有引用（加入表格的顺序在下面）。
+            Label modeText = new Label(modeText(mode), Styles.defaultLabel);
+            modeText.setAlignment(Align.center);
+            modeText.setColor(modeColor(mode));
+            modeText.setWrap(true);
 
-            Label bonusText = new Label(bonusText(mode), Styles.defaultLabel);
-            bonusText.setAlignment(Align.center);
-            bonusText.setColor(Pal.accent);
-            bonusText.setWrap(true);
-
-            Label[] rows = {levelText, bonusText};
+            Label[] rows = {modeText};
 
             // 滑块：范围 [-3, +3]、步长 1 = 7 个离散档位，
             // 自左至右 3级节能 → 2级 → 1级 → 关闭 → 1级超频 → 2级 → 3级（关闭恰在正中）
             pane.slider(-maxLevel, maxLevel, 1f, mode, v -> {
                 int m = Mathf.round(v);
-                rows[0].setText(modeName(m));
+                rows[0].setText(modeText(m));
                 rows[0].setColor(modeColor(m));
-                rows[1].setText(bonusText(m));
                 configure(m);
             }).height(28f).padBottom(2f).row();
 
-            // 当前档位（滑块下方）
-            pane.add(levelText).width(uiWidth).padBottom(2f).row();
-            // 当前档位的加成信息（文本下方）
-            pane.add(bonusText).width(uiWidth).row();
+            // 当前档位 + 加成（滑块下方）
+            pane.add(modeText).width(uiWidth).row();
         }
 
         /**
-         * 当前档位的加成摘要：关闭 → 「无效果」；否则取对应效果的 {@code summary(level)}——
-         * 与强化详情面板用的是同一份数值与文案，不会两处不同步。
+         * 档位说明文本：关闭 → 「无效果」；否则「{档位名}，{加成摘要}」，
+         * 如「1级节能，-20%电力消耗，-15%生产效率」「3级超频，+300%生产效率，+500%电力消耗，-45生命/秒」。
+         *
+         * <p>与强化详情面板（{@code Boost#description}）用的是<b>同一份</b>档位名与 {@code summary} 数值/文案，
+         * 不会两处不同步。
          */
-        private String bonusText(int mode){
+        private String modeText(int mode){
             if(mode == 0 || mode > maxLevel || mode < -maxLevel){
                 return Core.bundle.get("block.silicon-efficiency-control-tower.bonus.off");
             }
             return mode < 0
-                ? EnergySavingBoost.instance.summary(-mode)
-                : OverclockBoost.instance.summary(mode);
+                ? EnergySavingBoost.instance.name(-mode) + "，" + EnergySavingBoost.instance.summary(-mode)
+                : OverclockBoost.instance.name(mode) + "，" + OverclockBoost.instance.summary(mode);
         }
 
         @Override
@@ -431,20 +430,6 @@ public class EfficiencyControlTower extends Block{
             }else{
                 drawArea(x, y, halfRangePx(), modeColor(mode), 0.08f);
             }
-        }
-
-        /**
-         * 档位的显示文本：直接取<b>对应效果的档位名</b>（如「2级节能」），不另建一套 key——
-         * 单一数据源，改文案时配置面板与强化消息面板同步生效，不会两处不同步。
-         * 越界值回落到「关闭」。
-         */
-        private static String modeName(int mode){
-            if(mode == 0 || mode > maxLevel || mode < -maxLevel){
-                return Core.bundle.get("block.silicon-efficiency-control-tower.mode.off");
-            }
-            return mode < 0
-                ? EnergySavingBoost.instance.name(-mode)
-                : OverclockBoost.instance.name(mode);
         }
     }
 }

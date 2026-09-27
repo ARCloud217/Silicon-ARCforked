@@ -83,7 +83,7 @@ public class EnergySavingBoost implements BuildingBoostSystem.Boost, BlockConsum
         StringBuilder sb = new StringBuilder();
         for(int i = 0; i < powerScales.length; i++){
             if(i > 0) sb.append('\n');
-            sb.append(Core.bundle.format("boost.energy_saving.line", i + 1, summary(i + 1)));
+            sb.append(Core.bundle.format("boost.energy_saving.line", name(i + 1), summary(i + 1)));
         }
         return sb.toString();
     }
@@ -97,7 +97,7 @@ public class EnergySavingBoost implements BuildingBoostSystem.Boost, BlockConsum
     public String summary(int level){
         int i = BuildingBoostSystem.levelIndex(level, powerScales.length);
         return Core.bundle.format("boost.energy_saving.bonus",
-            BuildingBoostSystem.percentText(1f - powerScales[i]), BuildingBoostSystem.percentText(1f - speedScales[i]));
+            BuildingBoostSystem.percentText(powerScales[i] - 1f), BuildingBoostSystem.percentText(speedScales[i] - 1f));
     }
 
     // 目标过滤：耗电工厂。consPower != null 即「该方块类型登记了电力 consumer」（PowerGraph 汇总需求时只认它），
@@ -142,12 +142,12 @@ public class EnergySavingBoost implements BuildingBoostSystem.Boost, BlockConsum
 
     @Override
     public float powerFactor(Building build, int level){
-        return powerScales[BuildingBoostSystem.levelIndex(level, powerScales.length)];
+        return BuildingBoostSystem.levelValue(powerScales, level);
     }
 
     @Override
     public float speedFactor(Building build, int level){
-        return speedScales[BuildingBoostSystem.levelIndex(level, speedScales.length)];
+        return BuildingBoostSystem.levelValue(speedScales, level);
     }
 
     /**

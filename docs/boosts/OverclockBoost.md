@@ -119,8 +119,15 @@ crafter.progress += crafter.getProgressIncrease(craftTime) * (factor - 1f);
 | 方法 | 内容 | 来源 |
 |------|------|------|
 | `name()` | `超频` / `Overclock` | bundle `boost.overclock.name` |
-| `description()` | 逐档一行：`{0}级：生产 {1}，耗电 {2}，-{3} 生命/秒` | bundle `boost.overclock.level`（由 `description()` 按倍率表拼装，非单行 key） |
+| `name(int level)` | `1级超频` / `Overclock Lv.1` | bundle `boost.overclock.levelName` |
+| `summary(int level)` | `+50%生产效率，+30%电力消耗，-4生命/秒` | bundle `boost.overclock.bonus` = `{0}生产效率，{1}电力消耗，-{2}生命/秒`，三个占位由**倍率表 + 掉血表**现算（`{2}` 取 `damageRates`） |
+| `description()` | 逐档一行：`1级超频，+50%生产效率，+30%电力消耗，-4生命/秒` | bundle `boost.overclock.line` = `{0}，{1}`，`{0}` 传 `name(level)`（**档位名**，不是数字） |
+| `name(Building)` / `description(Building)` | 只给**当前生效档**（按 `BuildingBoostSystem.levelOf` 回查），不列全部三档 | — |
 | `visual(Building)` | **统一图标** `BuildingBoostSystem.badgeIcon()` | 强化徽记（底色 `Pal.lightFlame` 火焰橙） |
+
+> **百分比符号口径**：`BuildingBoostSystem.percentText(ratio)` **如实加符号**（正 → `+`，负 → `-`），
+> 调用方统一传带符号差值 `scale - 1f`。超频三项倍率均 > 1，故生产/耗电恒为 `+`；掉血是独立的
+> `-{2}` 字面量。早前版本 `percentText` 把「正数」当「节省量」渲染成负号，超频会被印成 `-50%`，已修正。
 
 > 按钮**如何绘制**（位置/尺寸/按光标距离淡入/点击命中）与点击后**投递什么格式的消息**，
 > 由 `BuildingBoostSystem` 与 `silicon.util.BoostOverlay` 负责，见 `docs/utils/BuildingBoostSystem.md`。
@@ -139,8 +146,15 @@ crafter.progress += crafter.getProgressIncrease(craftTime) * (factor - 1f);
 
 ## 已知副作用
 
-- `efficiency` 被抬到 1.5 是**总标量**，故凡依赖它的判定都等比变化（生产进度、`optionalEfficiency`、
-  依赖 `efficiency > 0` 的产出节流）——这正是「生产速度 +50%」的期望语义。
+- **耗电是真实的，且会「反过来限住」产能**：`requestedPower` 按倍率放大后，电网供电不足时
+  `power.status` 下降 → `updateConsumption` 的 `efficiency` 被压低 → **工厂可能完全停摆（产能 0）**。
+  3 档超频要 6 倍功率，2 档 2.25 倍，1 档 1.3 倍。也就是说**电网撑不住时超频不是「慢一点」，而是「不产」**。
+  这是「+500% 耗电」在 MJ 电力系统下的必然结果（`efficiency ≤ 1` 且与产能直接挂钩），不是 bug；
+  若希望「供电不足时按比例降速而非直接停产」，需改 `BlockConsumerHooks` 的策略（当前未做）。
+- 本效果**不抬 `efficiency`**（引擎 `updateConsumption` 取所有 consumer 的最小值、且初值即 1，
+  `efficiency` 恒 ≤ 1，抬不上去）。提速全部由 `BlockConsumerHooks.boostProgress` 向 `progress`
+  追加「超出 1 倍的那一份」实现，故 `efficiency`/`optionalEfficiency` 与依赖 `efficiency > 0`
+  的产出节流判定**保持原值**，超频不会顺带影响它们。
 - 方块面板的**耗电量**显示读的是钩子镜像的原值 `usage`（故仍显示标称值），
   **电力条**显示的是供电满足度 `power.status`，均不受倍率影响。即超频在面板上不可见，
   只能通过电网负载与产出速率观察（掉血则直接可见）。

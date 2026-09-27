@@ -413,8 +413,10 @@ public final class BuildingBoostSystem {
      * <p>供「引擎钩子」与效果自身取当前档位：效果实现是<b>单例</b>，档位不能存成实例字段
      * （多台 Provider 会互相覆盖），必须按目标回查其提供者。
      *
-     * <p>多个提供者时取<b>建筑 id 最小</b>者的档位（建筑 id 由服务器按放置顺序分配并同步，
-     * 两端一致），与互斥裁决的「最早提供者胜」同口径。
+     * <p>多个提供者时取<b>格坐标 (tileX, tileY) 字典序最小</b>者的档位——与
+     * {@code LubricantInjector#owns()} 同一口径：格坐标由地图派生，<b>客户端与服务器必然一致</b>，
+     * 且与 update 顺序无关。<b>刻意不用建筑 {@code id}</b>：它由各端的 {@code EntityGroup.nextId()}
+     * 本地分配、只靠实体状态快照同步，属「未验证两端一致」的量，不适合做裁决键。
      *
      * <p>零分配。返回值仅在对应效果当前生效时才有意义（调用方通常先判 {@link #isActive}）。
      *
@@ -431,11 +433,17 @@ public final class BuildingBoostSystem {
             return 0;
         }
         Provider best = null;
-        int bestId = Integer.MAX_VALUE;
+        int bestX = Integer.MAX_VALUE, bestY = Integer.MAX_VALUE;
         for (Provider provider : set) {
             Building b = provider.building();
-            if (b != null && b.id < bestId) {
-                bestId = b.id;
+            if (b == null) {
+                continue;
+            }
+            // 字典序比较 (tileX, tileY)：两端一致，且不依赖 Provider 的遍历/登记顺序
+            int px = b.tileX(), py = b.tileY();
+            if (px < bestX || (px == bestX && py < bestY)) {
+                bestX = px;
+                bestY = py;
                 best = provider;
             }
         }
@@ -459,12 +467,35 @@ public final class BuildingBoostSystem {
     }
 
     /**
-     * 倍率 → 百分比文本：{@code 0.2f} → {@code "-20%"}，{@code -0.5f} → {@code "+50%"}。
-     * 用于强化详情/配置面板的加成文案，避免各效果各写一遍格式化。
+     * 按档位取倍率表中的值：等价于 {@code table[levelIndex(level, table.length)]}，
+     * 但<b>表为空时回落到 1f（原样、不改变任何量）</b>，不会抛数组越界。
+     *
+     * <p>倍率表是各效果上的 <b>public 可变字段</b>，别的 mod（或本 mod 后续改动）有可能把它置空。
+     * 效果失效不该让游戏崩在这种地方，故把「表空了」当作「本效果不改变任何量」处理。
+     *
+     * @param table 倍率表（索引 0 = 1 级），可为 null / 空
+     * @param level 档位（自 1 起），越界自动夹到最近合法档
+     */
+    public static float levelValue(float[] table, int level) {
+        if (table == null || table.length == 0) {
+            return 1f;
+        }
+        return table[levelIndex(level, table.length)];
+    }
+
+    /**
+     * 倍率差 → 百分比文本，<b>符号与数值一致</b>：{@code 0.5f} → {@code "+50%"}，
+     * {@code -0.2f} → {@code "-20%"}，{@code 0f} → {@code "0%"}。
+     *
+     * <p><b>调用方必须传入带符号的差值</b>（{@code scale - 1f}）：节能是负的（0.8× → -20%），
+     * 超频是正的（1.5× → +50%）。本方法只负责如实加符号，<b>不反转</b>——早期版本把「正数」当作
+     * 「节省量」渲染成负号，导致节能恰好正确、超频却把 +50% 印成 -50%，故改为统一的有符号口径。
+     *
+     * <p>用于强化详情/配置面板的加成文案，避免各效果各写一遍格式化。
      */
     public static String percentText(float ratio) {
         int v = Math.round(ratio * 100f);
-        String sign = v > 0 ? "-" : v < 0 ? "+" : "";
+        String sign = v > 0 ? "+" : v < 0 ? "-" : "";
         return sign + Math.abs(v) + "%";
     }
 

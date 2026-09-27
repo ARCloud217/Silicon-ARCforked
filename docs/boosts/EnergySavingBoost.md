@@ -106,8 +106,14 @@ MJ 里工厂的电力与速率**都不是每建筑可写字段**：
 | 方法 | 内容 | 来源 |
 |------|------|------|
 | `name()` | `节能` / `Energy Saving` | bundle `boost.energy_saving.name` |
-| `description()` | 逐档一行：`{0}级：耗电 {1}，生产 {2}` | bundle `boost.energy_saving.level`（由 `description()` 按倍率表拼装，非单行 key） |
+| `name(int level)` | `1级节能` / `Energy Saving Lv.1` | bundle `boost.energy_saving.levelName` |
+| `summary(int level)` | `-20%电力消耗，-15%生产效率` | bundle `boost.energy_saving.bonus` = `{0}电力消耗，{1}生产效率`，两个占位由**倍率表**现算 |
+| `description()` | 逐档一行：`1级节能，-20%电力消耗，-15%生产效率` | bundle `boost.energy_saving.line` = `{0}，{1}`，`{0}` 传 `name(level)`（**档位名**，不是数字） |
+| `name(Building)` / `description(Building)` | 只给**当前生效档**（按 `BuildingBoostSystem.levelOf` 回查），不列全部三档 | — |
 | `visual(Building)` | **统一图标** `BuildingBoostSystem.badgeIcon()` | 强化徽记（底色 `Pal.powerLight` 电量蓝，区别于润滑油的默认绿） |
+
+> **百分比符号口径**：`BuildingBoostSystem.percentText(ratio)` **如实加符号**（正 → `+`，负 → `-`），
+> 调用方统一传带符号差值 `scale - 1f`。本效果两项倍率均 < 1，故差值为负、文字恒为 `-20%` 这样的「减少」。
 
 > 按钮**如何绘制**（位置/尺寸/按光标距离淡入/点击命中）与点击后**投递什么格式的消息**，
 > 由 `BuildingBoostSystem` 与 `silicon.util.BoostOverlay` 负责，见 `docs/utils/BuildingBoostSystem.md`。

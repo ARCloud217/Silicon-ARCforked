@@ -185,10 +185,12 @@ public class BoostOverlay implements BuildingBoostSystem.VisualRenderer {
         for (Hit hit : hits) {
             if (!hit.rect.contains(wx, wy)) continue;
             // 命中区是上一帧记录的（建筑静止故世界坐标稳定）；投递前再校验目标仍然有效且仍有强化，
-            // 避免点空或点到已失效的残留条目
+            // 避免点空或点到已失效的残留条目。
+            // 注意：失效条目必须 continue 而非 return —— 否则一个恰好盖住光标的失效条目
+            // 会吞掉这次点击，其后真正命中的强化按钮再也点不到（多个徽记密集时尤其明显）。
             Building target = hit.target;
             if (target == null || !target.isValid() || !BuildingBoostSystem.hasActiveBoosts(target)) {
-                return;
+                continue;
             }
             postBoostInfo(target);
             return;
@@ -200,7 +202,7 @@ public class BoostOverlay implements BuildingBoostSystem.VisualRenderer {
      * 内容逐行「[cyan]{强化名}[]：{强化效果}」，气泡色 #99cc3366，10 秒后消失。
      */
     private static void postBoostInfo(Building target) {
-        if (target == null) return;
+        if (target == null || target.block == null) return;
         Seq<BuildingBoostSystem.Boost> boosts = BuildingBoostSystem.activeBoosts(target);
         if (boosts.isEmpty()) return;
 

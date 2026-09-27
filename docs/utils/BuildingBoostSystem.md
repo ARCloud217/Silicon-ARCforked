@@ -183,9 +183,25 @@
 - **队伍**：一律 `==` 比较 `Team`（跨端一致枚举单例）；禁止用本地玩家身份做规则判定（服务器无本地玩家）。
 - **确定性红线**：任何决定「扣/加多少网络化状态（液体/功率/库存）」的分支都**不得依赖 update 顺序或
   「谁先注册」**——两端建筑 update 顺序不保证一致，会造成永久分歧（desync）。必须用两端一致的量裁决
-  （tile 坐标、建筑 id、队伍、已同步的液体量）。参考实现：`LubricantInjector.owns()` 按 (tileX, tileY)
+  （tile 坐标、队伍、已同步的液体量）。参考实现：`LubricantInjector.owns()` 按 (tileX, tileY)
   裁决唯一认领者。System 曾提供的 `claimedByOther`（基于「谁先跑 update」）因属顺序依赖、存在 desync 隐患，
   **已删除**，不再作为对外 API。
+
+### 档位裁决为什么不用建筑 id
+
+`levelOf(target, boostId)` 在同一目标有多个 Provider 时需要一个**跨端一致的裁决键**。曾经的实现用
+`Building.id` 最小者，**现已改为 `(tileX, tileY)` 字典序最小者**，原因：
+
+- `Building` 的 `id` 在**构造时**由 `EntityGroup.nextId()` 在**各端本地**分配，只靠实体状态快照
+  间接同步；而 `Building.write(Writes)` 本身是**空实现**（不序列化 `id`）。也就是说 `id` 是否在
+  「客户端 / 服务器 / 存档加载后」三者间始终一一对应，属于**未经验证**的假设。
+- 建筑 update 顺序、以及快照到达的先后都可能让两端 `id` 分配序列出现分歧，一旦用 `id` 决定
+  「用谁的档位」，就会算出**不同的耗电/掉血量**——正是上面那条确定性红线要禁止的事。
+- `(tileX, tileY)` 由地图派生，**两端必然一致**，且与遍历/登记顺序无关；口径也与
+  `LubricantInjector.owns()` 一致，全项目统一。
+
+同理，`resolveMutex` 的互斥裁决只按「优先级 + 效果 id 字典序」决定**哪个效果胜出**（不依赖 Provider 顺序），
+`contributors` 用 `ObjectSet` 遍历顺序不影响最终结果，因为结果只依赖上面这些确定性键。
 - 客户端独有逻辑（`BoostOverlay` 调试渲染）由 `Vars.headless` 跳过，且只读网络化状态。
 
 ## 对外 API
@@ -202,7 +218,8 @@
 | `activeBoosts(target)` | 查目标当前生效的**效果单元列表**（`Seq<Boost>`，每次新建，**仅供点击/开面板等低频路径**，勿放每帧循环） |
 | `hasActiveBoosts(target)` | 目标是否还有生效强化（零分配，供每帧轮询） |
 | `isActive(target, boostId)` | 指定效果当前是否生效（零分配 O(1)）。**供「引擎钩子」在被引擎回调时查询自身倍率**——钩子不能缓存每建筑状态（缓存会产生两端不同步窗口） |
-| `levelOf(target, boostId)` | 该效果在目标上的**档位**（0 = 无有效提供者）。**供「同一效果多强度档」**（如效率控制塔 1~3 级节能/超频）：效果实现是**单例**、档位不能存实例字段（多台塔会互相覆盖），故档位由 Provider 持有、按目标回查。多个提供者时取**建筑 id 最小**者（与互斥裁决同口径、两端一致）。零分配 |
+| `levelOf(target, boostId)` | 该效果在目标上的**档位**（0 = 无有效提供者）。**供「同一效果多强度档」**（如效率控制塔 1~3 级节能/超频）：效果实现是**单例**、档位不能存实例字段（多台塔会互相覆盖），故档位由 Provider 持有、按目标回查。多个提供者时取 **格坐标 `(tileX, tileY)` 字典序最小**者（与 `LubricantInjector.owns()` 同口径；**刻意不用建筑 `id`**，见下方「档位裁决为什么不用建筑 id」）。零分配 |
+| `levelValue(table, level)` | 按档位取倍率表的值，等价 `table[levelIndex(level, table.length)]`，但**表为空时回落 `1f`（不改变任何量）**而不抛越界。倍率表是各效果上的 public 可变字段，被别的 mod 置空时不应让游戏崩在这种地方 |
 | `isProviderOf(target, provider, id)` | 提供归属：本强化器是否当前有效提供者（读 `contributors`，两端一致，**可安全用于**耗网络化资源决策） |
 | `updateBoosts(provider)` | 每帧驱动入口（兼触发每 tick 统一冲洗） |
 | `removeProvider(provider)` | 移除强化器并即时重算受影响目标（`onRemoved` 钩子 / 清扫兜底） |
@@ -315,7 +332,8 @@ System 撤销某个 Provider 贡献的**唯一**路径是：该 Provider 仍被 
 | a0.x | 新增钩子式效果范式与 `isActive(target, boostId)`（零分配 O(1)）：供效果在「引擎钩子被回调时」查询自身生效状态。新增首个钩子式效果 `EnergySavingBoost`（`docs/boosts/EnergySavingBoost.md`）+ 通用钩子工具 `BlockConsumerHooks`；新增「1b. 钩子式效果」示例章节 |
 | a0.x | 名单 `boostableTypes` 追加工厂 `GenericCrafterBuild`（原仅炮塔）；新增「⚠ Provider 作者必读：想让效果停掉时只能靠 `canTarget()`」——记录撤销贡献的唯一路径（`boosts()`/`targets()` 恒定返回完整集合，条件只判 `canTarget`），避免开关类 Provider 出现贡献永不撤销的卡死 |
 | a0.x | 互斥裁决**保持**「优先级 + 效果 id 字典序」的纯函数排序键（曾短暂试过按提供者建筑 id 实现「先放置者胜」，已撤回）：字典序两端必然一致，且结果与放置顺序/玩家操作时序无关，不会因「谁先放」而改变；例：节能(`energy_saving`) 与 超频(`overclock`) 冲突时恒为节能胜出 |
-| a0.x | 新增「档位」范式：`Provider.levelOf(Boost)` + `BuildingBoostSystem.levelOf(target, boostId)`（零分配，多提供者取建筑 id 最小者）。供「同一效果多强度档」——效果实现是单例，档位存实例字段会被多台提供者互相覆盖，故档位由 Provider 持有、按目标回查。`BlockConsumerHooks.FactorSource` 的倍率方法改为接收档位参数 |
+| a0.x | 新增「档位」范式：`Provider.levelOf(Boost)` + `BuildingBoostSystem.levelOf(target, boostId)`（零分配，多提供者取 **(tileX, tileY) 字典序最小**者）。供「同一效果多强度档」——效果实现是单例，档位存实例字段会被多台提供者互相覆盖，故档位由 Provider 持有、按目标回查。`BlockConsumerHooks.FactorSource` 的倍率方法改为接收档位参数 |
 | a0.x | **强化徽记图标统一**：新增 `silicon.util.boosts.BoostBadge.icon()` 作为唯一图标来源（原版「超频」状态图标），三个效果的 `visual()` 全部改用它，换图标只需改一处。徽记语义收敛为「该建筑有强化生效」，具体效果/档位由点击后的消息面板逐行列出。`BoostOverlay.render` 增加回落：`visual()` 或其 `icon()` 为 null 时用统一图标兜底，保证「有强化必显徽记」 |
 | a0.x | 合并小工具类进 System：原独立的 `boosts.BoostBadge` / `boosts.BoostText` 迁入本类，成为 `BuildingBoostSystem.badgeIcon()` / `levelIndex(level, length)` / `percentText(ratio)`，两个文件删除（`boosts` 包只剩 `BlockConsumerHooks` 与三个效果实现） |
 | a0.x | 徽记淡入改为**分段**：≤2 格恒定 80%（`maxAlpha` 0.4→0.8，新增 `nearDistance` = 2 格）、2~10 格线性衰减到 0（`fadeDistance` 3 格→10 格）、超出 10 格不渲染 |
+| a0.x | **自检修复**（多人/健壮性）：① `levelOf` 多提供者裁决键由「建筑 `id` 最小」改为「`(tileX, tileY)` 字典序最小」，移除对 `EntityGroup.nextId()` 本地分配这一未验证量的依赖（详见「档位裁决为什么不用建筑 id」）；② `BoostOverlay.checkInput` 命中失效条目时由 `return` 改为 `continue`——原先一个恰好盖住光标的失效条目会吞掉整次点击，导致其后真正命中的徽记点不到（徽记密集时尤其明显）；③ `EfficiencyControlTower.drawPlace` 补 `Vars.player == null` 保护（无头/专服渲染时 `Vars.player.team()` 会 NPE），此时退回按「可放置」显示、不做重叠判定；④ `BoostOverlay.postBoostInfo` 补 `target.block == null` 保护；⑤ 新增 `levelValue(table, level)` 并让两个效果的 `FactorSource` 走它——倍率表被置空时回落 `1f` 而非抛数组越界，`OverclockBoost.apply` 的提速/掉血同样加空表保护（空表 = 既不提速也不掉血） |
