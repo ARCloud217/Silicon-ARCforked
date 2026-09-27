@@ -8,6 +8,7 @@
 | 包 | `silicon.util` |
 | 类型 | `final class` 静态工具/调度器 |
 | 效果实现位置 | `src/silicon/util/boosts/`（具体 Boost 效果类） |
+| 各效果的独立文档 | `docs/boosts/<Boost类名>.md`（逐个效果单元成文，如 `LubricantBoost.md`） |
 
 建筑强化（Boost）体系：一套给「建筑/机器」附加 buff 的**建筑专用强化功能系统**，统一管理强化器（Provider）→ 效果（Boost）→ 目标（Building）的全流程。
 

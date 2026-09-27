@@ -43,29 +43,26 @@ Provider 落地实现。本方块**不再私写炮塔专用逻辑**，只负责�
 
 ### 提供的效果（Boost）
 
-润滑油提供的两种强化合并为**一个效果单元** `LubricantBoost`（id=`lubricant`），内部含两个子效果，
-各自生效条件独立判定、激活期间每帧按需注入（注入式语义，失格即自动失效）：
+本方块只提供**一个效果单元** `LubricantBoost`（id=`lubricant`），把润滑油的全部强化打包在一起
+（攻速 +20%、转角 ×2，内部为两个独立判定条件的子效果，注入式语义）。
 
-| 子效果 | 内容 | 触发条件 | 注入内容 |
-|--------|------|----------|----------|
-| 攻速 | +20%（`firePotency=0.2`） | 炮塔 `isShooting()` | 每帧 `reloadCounter += firePotency×edelta()×ammoRM`，与强化液同加法池 |
-| 转角 | 速率 ×2（`rotationPotency=1.0`，引擎 1×+效果 1×） | `hasAmmo() && shouldTurn()` | 与引擎 turnToTarget 同式再推一格，目标角与引擎分支同源（自动索敌/玩家控制/逻辑控制），本帧无瞄准角则跳过 |
+> 效果单元的完整规格（触发条件、注入公式、目标角三分支、展示信息、数值参数、多人注意事项）
+> 见 **`docs/boosts/LubricantBoost.md`**。
 
-面板展示文案（bundle `boost.lubricant.name` / `boost.lubricant.desc`）：
-- 名称：`润滑油` / `Lubricant`
-- 描述：`+100% 旋转速度；+20% 攻击速度`（须与实际生效值一致）
+本方块与该效果的分工：
 
-- 攻速子效果仅攻击中生效 → 无攻击时零消耗零加成。
-- 转角子效果只要存油即生效，不额外耗油。
-- 效果为**注入式**（`remove` 无残留），自动注册进 System（静态块 `register(instance)`）。
-- **视觉**：`visual()` 返回带原版状态图标（`StatusEffects.overclock.uiIcon`，风格与游戏一致）的
-  `BoostVisual`；按钮底色统一用 `#99cc3366`（由渲染器默认提供）。受惠炮塔**左下角**显示一个
-  **0.5 格（4×4px）可点击按钮**（`BoostOverlay` 绘制 + 交互），按光标距离动态淡入（上限 40%，超出 3 格不渲染）。
-- **点击输出**：点击按钮向消息面板投递 10s 时限消息（气泡色 `#99cc3366`，**`.local()` 仅自己可见、不广播**），
-  标题「[accent]{方块名}[]中生效的Boost」，内容行为「[cyan]润滑油[]：+100% 旋转速度；+20% 攻击速度」，
-  **消息图标为该建筑自身的贴图**。
-- **面板文案**：`name()` / `description()` 走 bundle（`boost.lubricant.name` / `boost.lubricant.desc`），
-  描述为「+100% 旋转速度；+20% 攻击速度」，与实际生效值保持一致。
+| 归属 | 内容 |
+|------|------|
+| 本方块 | 何时提供（存油 + 独占认领）、扣多少油、提供哪些目标 |
+| `LubricantBoost` | 效果本身怎么算、怎么注入、展示什么名称/简述/图标 |
+| `BuildingBoostSystem` | 登记、互斥、不叠加、apply/remove 驱动、撤销生命周期 |
+
+### 强化概要
+
+| 子效果 | 内容 | 触发条件 |
+|--------|------|----------|
+| 攻速 | +20% | 炮塔 `isShooting()`（仅攻击中耗油） |
+| 转角 | 速率 ×2 | `hasAmmo() && shouldTurn()`（存油即生效，不额外耗油） |
 
 ### 不叠加与持续规则
 
@@ -84,17 +81,14 @@ Provider 落地实现。本方块**不再私写炮塔专用逻辑**，只负责�
 
 ```
 LubricantInjectorBuild.update()
- ├─ updateBoosts()  →  System（按世界 tick 每帧统一冲洗一次）
- │                     ├─ 前置过滤：targets() 只交炮塔（非可用对象不进循环）
- │                     ├─ 资格：同队 + 名单(isBoostable) + canTarget(存油 && owns 独占认领)
- │                     ├─ Boost 目标过滤：LubricantBoost.canTarget(仅炮塔)
- │                     ├─ 问 LubricantBoost.shouldApply → 每帧按认领集合重算计数
- │                     ├─ 互斥裁决 → apply（生效期间每帧一次，不叠加）/ remove
- │                     └─ sweepInvalid：清扫失效目标 / 失效注入器
- └─ 按「认领中(isProviderOf)且攻击中」的炮塔数扣油（Time.delta/60 折算真实秒）
+ ├─ updateBoosts()          → 交给 System：登记本机的提供意愿（targets/canTarget/boosts 已由本类定义），
+ │                              逐 tick 统一冲洗、互斥裁决与 apply/remove 均由 System 负责
+ └─ 按「本机独占认领(owns)且攻击中(isShooting)」的炮塔数扣油（Time.delta/60 折算真实秒）
 LubricantInjectorBuild.onRemoved()
  └─ removeProviderBoosts()  →  System 即时撤销本机提供的一切强化
 ```
+
+System 内部的登记顺序、目标过滤四层、互斥裁决与清扫流程见 `docs/utils/BuildingBoostSystem.md`。
 
 ### 生涯/状态管理
 
@@ -106,9 +100,9 @@ LubricantInjectorBuild.onRemoved()
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `consumePerTurret` | float | 5f | 每个攻击中的受惠炮塔每秒润滑油消耗 |
+| `consumePerTurret` | float | 5f | 每个正在攻击的受惠炮塔每秒润滑油消耗 |
 
-Boost 的数值可改单例公开字段：`LubricantBoost.instance.firePotency` / `LubricantBoost.instance.rotationPotency`。
+效果数值（`firePotency` / `rotationPotency`）属效果单元，见 `docs/boosts/LubricantBoost.md`。
 
 ## 液体处理
 
@@ -120,14 +114,11 @@ Boost 的数值可改单例公开字段：`LubricantBoost.instance.firePotency` 
 | 版本 | 变更 |
 |------|------|
 | a0.x | 初始：攻速 +20%（强化液同池加法）、转角 ×2（自动索敌/玩家控制同等生效）、5/s 消耗、同队门禁 |
-| a0.x | 重构为 BuildingBoostSystem Provider：强化内容抽为 Boost（`silicon.util.boosts`），资格/队伍/互斥/撤销生命周期交由 System 统一管理 |
+| a0.x | 重构为 BuildingBoostSystem Provider：强化内容抽为 Boost（`silicon.util.boosts`），资格/队伍/互斥/撤销生命周期交由 System 统一管理（效果规格见 `docs/boosts/LubricantBoost.md`） |
 | a0.x | 合并为单一 `LubricantBoost`（id=`lubricant`）：攻速/转角作为两个子效果打包在一个效果单元内 |
 | a0.x | 落实「不叠加 + 持续由注入器控制」：System 每帧统一冲洗、同一效果至多一份；新增 `onRemoved()` → `removeProviderBoosts()` 拆除即撤销 |
-| a0.x | 认领制（唯生效者耗油）：`canTarget` 检查 `claimedByOther`，目标已被别台认领则本机取消提供；扣油按 `isProviderOf(target) && isShooting` 计数，双注入器夹同一炮塔不再双倍油耗 |
+| a0.x | 认领制（唯生效者耗油）：目标已被别台注入器认领时本机取消提供；扣油按「认领中且攻击中」计数，双注入器夹同一炮塔不再双倍油耗 |
 | a0.x | 多人安全加固：认领由「先到先得（update 顺序）」改为**确定性 tile 坐标裁决** `owns()`——紧贴同一炮塔的同队有油注入器中 (tileX, tileY) 最小者独占，避免两端 update 顺序差异导致扣不同机器的油、液体量 desync |
 | a0.x | 性能：boost 列表提为方块级共享只读 Seq（不再每帧 `Seq.with`）；紧贴炮塔列表按 tick 重建并复用同一 Seq，`targets()` 与扣油循环共用（不再每帧新建 + 重扫 proximity） |
 | a0.x | 目标过滤双层化：注入器 `targets()` 前置过滤只交炮塔（非可用对象不进 System 循环）；`Boost.canTarget` 目标过滤 + System 读取执行（`LubricantBoost.canTarget` = 仅炮塔） |
-| a0.x | 调试视觉：`LubricantBoost.visual()` 返回带图标/底板色的 `BoostVisual`，受惠炮塔上方由 `BoostOverlay` 绘制效果名 |
-| a0.x | 视觉改为图标徽记：改用原版状态图标 `StatusEffects.overclock.uiIcon`，在方块**左下角**显示（原文字显示与 `boost.lubricant.name` bundle 已移除） |
-| a0.x | 徽记调整：底板改用游戏强调色 `Pal.accent`（绿）；尺寸以 32px 为上限按方块自适应，紧贴左下角内侧不越出方块轮廓 |
-| a0.x | 徽记固定为左下角 1×1 格（8×8px）；新增点击徽记展开强化详情面板（名称 + 简述，走 bundle 归类管理） |
+| a0.x | 提供展示信息（`name()` / `description()` / `visual()` 图标），**强化按钮的绘制、点击与消息输出由 System + `BoostOverlay` 负责**，不计入本方块；效果规格迁至 `docs/boosts/LubricantBoost.md` |
