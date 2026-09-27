@@ -10,6 +10,7 @@ import silicon.world.blocks.container.DualPurposeStorager;
 import silicon.world.blocks.defense.LubricantInjector;
 import silicon.world.blocks.defense.Switch;
 import silicon.world.blocks.distribution.ItemTransferHub;
+import silicon.world.blocks.effect.EfficiencyControlTower;
 import silicon.world.blocks.distribution.Junction;
 import silicon.world.blocks.distribution.UniversalJunction;
 import silicon.world.blocks.power.GeneratorPump;
@@ -29,7 +30,7 @@ public class Blocks {
     public static Block powerGeneratorPump, dualPurposeJunction, dualPurposeStorager,
             rollGenerator, powerProtector, powerSource, mineConverter, theSwitch, itemTransferHub,
             dimensionAnchor, signalSource, universalJunction, signalRelay, messageTest, petroleumRefinery,
-            lubricantInjector;
+            lubricantInjector, efficiencyControlTower;
 
     public static void load() {
         powerGeneratorPump = new GeneratorPump("power-generator-pump") {{
@@ -160,6 +161,17 @@ public class Blocks {
             alwaysUnlocked = true;
             size = 2;
             health = 220;
+        }};
+        // 效率控制塔：3x3 支援方块，以塔为中心 15x15 格区域内，耗电的己方工厂附上「节能」强化
+        // （电力 -20%、生产速度 -10%，两者由 MJ 的电力请求/建筑效率两个独立入口实现，互不干扰）。
+        // 配置面板滑块切换「关闭 / 节能」，走标准 config 链路（联网全端一致 + 存盘持久化）。
+        // 区域内可含多台塔：System 按「同一效果至多一份」处理，不会成倍叠加。
+        efficiencyControlTower = new EfficiencyControlTower("efficiency-control-tower") {{
+            requirements(Category.effect, BuildVisibility.shown,
+                    ItemStack.with(Items.copper, 200, Items.lead, 150, Items.silicon, 80));
+            alwaysUnlocked = true;
+            size = 3;
+            health = 300;
         }};
     }
 }

@@ -8,6 +8,7 @@ import arc.struct.Seq;
 import mindustry.Vars;
 import mindustry.gen.Building;
 import mindustry.world.blocks.defense.turrets.Turret;
+import mindustry.world.blocks.production.GenericCrafter;
 
 /**
  * 建筑强化系统：统一管理强化器（{@link Provider}）给建筑提供 boost 的全过程。
@@ -111,6 +112,8 @@ public final class BuildingBoostSystem {
 
     static {
         boostableTypes.add(Turret.TurretBuild.class);
+        // 工厂：供「节能」等工厂类效果（见 EfficiencyControlTower / EnergySavingBoost）
+        boostableTypes.add(GenericCrafter.GenericCrafterBuild.class);
     }
 
     /**
@@ -218,6 +221,28 @@ public final class BuildingBoostSystem {
         /** 强化器自身的附加目标过滤（如朝向/距离），默认全放行；队伍与名单由 System 统一判。
          *  <p><b>多人注意</b>：本方法在客户端与服务器都会执行且结果必须一致——不得依赖 update 顺序
          *  或本地状态，否则两端提供集合不同会造成分歧。 */
+        /**
+         * 本机当前是否为<b>该效果</b>提供（默认恒为是）。
+         *
+         * <p><b>逐效果开关的正确位置</b>：Provider 若有「模式 / 档位 / 状态」等条件
+         * （如同一台方块在不同模式下提供<b>不同</b>的效果），必须用本方法逐个效果表达，
+         * <b>不能</b>靠「boosts() 只返回当前模式那一个效果」——见文档「⚠ Provider 作者必读」：
+         * System 只遍历 {@link #boosts()} 里列出的效果，没列出的效果其旧贡献<b>永远不会被撤销</b>。
+         *
+         * <p>返回 false 时 System 走正规的「意愿为 false → 撤销该效果」路径，
+         * 效果会立即被 {@link Boost#remove(Building)} 撤销。
+         */
+        default boolean provides(Boost boost) {
+            return true;
+        }
+
+        /**
+         * 强化器本帧对某目标的可用门槛（在队伍/名单之外，Provider 自身的粗筛，如「本机是否开机」）。
+         * 逐效果的开关请用 {@link #provides(Boost)}。
+         *
+         * <p>System 在登记前读取本方法，故返回 false 的目标不登记贡献、不会进
+         * {@link #apply(Building)}。默认全放行。
+         */
         default boolean canTarget(Building target) {
             return true;
         }
@@ -329,6 +354,22 @@ public final class BuildingBoostSystem {
     }
 
     /**
+     * 指定效果当前是否在目标上生效（零分配，O(1)）。
+     *
+     * <p>供「引擎钩子」在<b>被引擎回调时</b>查询自身倍率用：钩子不能缓存每建筑状态
+     * （缓存会在两端产生不同步窗口），只能在每次被查询时回到 System 问一次。
+     *
+     * <p>注意：读的是本 tick 冲洗后的状态，若钩子所在子系统（电力图 / consumer 结算）的更新
+     * 早于本 System 冲洗，则该 tick 读到的是上一 tick 的状态——对倍率类效果只是 1 tick 滞后，不影响正确性。
+     *
+     * @param boostId 效果 id（见 {@link Boost#id()}）
+     */
+    public static boolean isActive(Building target, String boostId){
+        ObjectMap<String, Boolean> map = active.get(target);
+        return map != null && Boolean.TRUE.equals(map.get(boostId));
+    }
+
+    /**
      * 提供归属查询（供强化器决定是否耗资源）：本机当前是否已登记为该目标该效果的有效提供者。
      *
      * <p><b>多人注意</b>：本判定读的是 {@code contributors}（由两端一致的输入推导），故两端结果相同；
@@ -396,11 +437,14 @@ public final class BuildingBoostSystem {
         ObjectMap<String, ObjectSet<Provider>> targetContributors = contributors.get(target);
 
         Seq<Boost> boosts = provider.boosts();
+        // 注：arc 的 Seq 在本引擎里 size 是 public 字段（无 size() 方法），故用 boosts.size
         for (int i = 0, n = boosts.size; i < n; i++) {
             Boost boost = boosts.get(i);
             String id = boost.id();
-            // 生效意愿 = 公共关(队伍/名单/Provider.canTarget) && Boost 自身目标过滤 && 触发条件
-            boolean want = eligible && boost.canTarget(target) && boost.shouldApply(target);
+            // 生效意愿 = 公共关(队伍/名单/Provider.canTarget) && Provider 逐效果开关(模式等)
+            //          && Boost 自身目标过滤 && 触发条件
+            boolean want = eligible && provider.provides(boost) && boost.canTarget(target)
+                    && boost.shouldApply(target);
 
             ObjectSet<Provider> set = targetContributors == null ? null : targetContributors.get(id);
             if (want) {
@@ -467,6 +511,9 @@ public final class BuildingBoostSystem {
     /**
      * 互斥裁决：目标上冲突的效果按优先级（同级 id 字典序）选胜者，败者挂起；
      * 挂起表每次裁决按本帧结论重建——胜者仍在则败者继续挂起，胜者消失则败者自然参选。
+     *
+     * <p>排序键只有 {@code priority()} 与效果 id 两项，<b>刻意不引入建筑 id / 放置顺序</b>：
+     * 字典序是纯函数，两端必然算出同一结果，且与玩家操作时序无关（不会因「谁先放」而改变结果）。
      */
     private static void resolveMutex(Building target, ObjectMap<String, ObjectSet<Provider>> tmap) {
         // 快速路径：至多一个效果时不可能冲突（绝大多数场景），直接清挂起表
@@ -488,7 +535,9 @@ public final class BuildingBoostSystem {
             return;
         }
 
-        // 高优先级优先，同级按 id 字典序（结果确定、跨强化器一致）
+        // 高优先级优先，同级按 id 字典序。
+        // 刻意只用「纯函数」做裁决键（优先级 + 效果 id）：两端必然算出同一结果，
+        // 且与放置顺序/玩家操作时序无关。
         ids.sort((a, b) -> {
             int c = Integer.compare(priorityOf(b), priorityOf(a));
             return c != 0 ? c : a.compareTo(b);

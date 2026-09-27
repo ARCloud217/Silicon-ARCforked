@@ -38,7 +38,7 @@
 | `apply(target)` | 生效（激活期间每 tick 一次） |
 | `remove(target)` | 撤销（失格/被顶替/目标失效时一次） |
 | `priority()` | 互斥优先级，数值大者胜，默认 0 |
-| `conflictsWith(otherId)` | 互斥声明：与指定效果是否冲突 |
+| `conflictsWith(otherId)` | 互斥声明：与指定效果是否冲突。冲突裁决**同级按效果 id 字典序**（纯函数、与放置顺序无关，两端必然一致） |
 | `visual(target)` | 视觉描述（可空，返回 `BoostVisual`） |
 
 `apply` 的两种实现语义（实现自选，保持统一）：
@@ -123,7 +123,7 @@
    （**零分配**：仅在真正增删成员时创建内层容器，稳态不新建对象；空集合/空条目即时回收）。
 2. **冲洗阶段**（用 `Vars.state.tick` 归组，**每 tick 只会执行一次**，由本 tick 首次调用触发）：应生效集合直接由
    `contributors` 推导（人数 > 0 且未被挂起），无需独立计数表：
-   - `resolveMutex`：对目标上所有「有人提供」的效果按优先级（同级按 id 字典序）排序、贪心保留；与已保留胜者冲突者写进 `suppressed`（挂起不生效）。挂起表每 tick 按本轮结论重建，胜者消失后败者自然恢复参选。**快速路径**：效果数 ≤ 1 直接判定无冲突，跳过排序与临时集合；
+   - `resolveMutex`：对目标上所有「有人提供」的效果按优先级排序、贪心保留；与已保留胜者冲突者写进 `suppressed`（挂起不生效）。挂起表每 tick 按本轮结论重建，胜者消失后败者自然恢复参选。**排序键**：`priority()` 降序 → 效果 id 字典序。**刻意只用纯函数做裁决键**（不引入建筑 id / 放置顺序）：字典序两端必然算出同一结果，且结果与玩家操作时序无关——不会因「谁先放」而改变，也就不存在两端时序不一致的隐患。**快速路径**：效果数 ≤ 1 直接判定无冲突，跳过排序与临时集合；
    - `reconcile`：应生效的**每 tick 调用一次 `apply`**（保证注入式逐帧累加、不叠加），不再应生效的调用一次 `remove`；生效状态表**原地更新**，不新建快照；
    - 随后 `sweepInvalid()`（**每 tick 一次**，不再每强化器每帧各跑一遍）清扫失效目标/强化器。
 
@@ -155,7 +155,8 @@
 - `sameTeam` 直接以 `Team` 枚举单例的 `==` 比较：跨端一致、确定，天然排除敌队/derelict，不依赖本地身份。
 - **目标过滤四层把关**（缺一不可，任何效果生效前都过）：
   1. Provider `targets()` 前置过滤——非可用对象连 System 循环都不进；
-  2. System 全局名单 `boostableTypes`（默认仅放行炮塔）；
+  2. System 全局名单 `boostableTypes`（默认放行**炮塔** `TurretBuild` 与**工厂** `GenericCrafterBuild`；
+     新增可强化类型须用 `addBoostable(...)` 登记，否则效果永不生效）；
   3. 同队 `sameTeam`；
   4. 每个 Boost 自带的 `canTarget(target)`（过滤逻辑写在 Boost 单元内，由 System 读取执行）。
   防止对非目标方块误用炮塔专用 API 造成崩溃。
@@ -183,6 +184,7 @@
 | `register(Boost)` | 自动注册效果（加载期调用，重复 id 覆盖） |
 | `activeBoosts(target)` | 查目标当前生效的**效果单元列表**（`Seq<Boost>`，每次新建，**仅供点击/开面板等低频路径**，勿放每帧循环） |
 | `hasActiveBoosts(target)` | 目标是否还有生效强化（零分配，供每帧轮询） |
+| `isActive(target, boostId)` | 指定效果当前是否生效（零分配 O(1)）。**供「引擎钩子」在被引擎回调时查询自身倍率**——钩子不能缓存每建筑状态（缓存会产生两端不同步窗口） |
 | `isProviderOf(target, provider, id)` | 提供归属：本强化器是否当前有效提供者（读 `contributors`，两端一致，**可安全用于**耗网络化资源决策） |
 | `updateBoosts(provider)` | 每帧驱动入口（兼触发每 tick 统一冲洗） |
 | `removeProvider(provider)` | 移除强化器并即时重算受影响目标（`onRemoved` 钩子 / 清扫兜底） |
@@ -211,6 +213,24 @@ public class AttackSpeedBoost implements BuildingBoostSystem.Boost {
 
 加载期注册：`BuildingBoostSystem.register(new AttackSpeedBoost());`
 
+### 1b. 钩子式效果（改不动「每建筑字段」时）
+
+有些量（如工厂的**耗电量** `ConsumePower.usage`、**生产速率** `GenericCrafter.craftTime`）在 MJ 里是
+**方块类型级共享对象**，直接改会连带影响该类型所有建筑（含敌方）→ 不可用。
+此时应改用引擎留给「按建筑个体」的 consumer 扩展点，见
+`src/silicon/util/boosts/BlockConsumerHooks.java` 与 `docs/boosts/EnergySavingBoost.md`：
+
+```java
+// apply() 只负责惰性安装钩子（幂等，只装被命中的方块）
+@Override public void apply(Building target) {
+    BlockConsumerHooks.install(target.block, hooks);
+}
+// 倍率由钩子每次被引擎查询时回调 isActive() 实时读 → 撤销自动回 1.0，无需还原
+@Override public void remove(Building target) { /* 钩子式：无需还原 */ }
+```
+
+**要点**：钩子**不得缓存**每建筑状态（会产生两端不同步窗口），只能在被查询时回到 `isActive()` 问一次。
+
 ### 2. Provider 方块接入
 
 ```java
@@ -225,6 +245,33 @@ public class LubricantInjectorBuild extends Building implements BuildingBoostSys
     }
 }
 ```
+
+#### ⚠ Provider 作者必读：想让效果「停掉」时，只能靠 `canTarget()`
+
+System 撤销某个 Provider 贡献的**唯一**路径是：该 Provider 仍被 `targets()` 遍历到，
+但它对某个 boost id 的**意愿为 false**（`collectContributions` 内的 `set.remove(provider)`）。
+因此 Provider 若有「开关 / 模式 / 停机条件」，**必须**遵守：
+
+| 错误做法 | 后果 |
+|---------|------|
+| 关闭时 `boosts()` 返回空列表 | 该 boost id 根本不会被遍历 → 旧贡献永不撤销 → 效果卡在开启状态 |
+| 关闭时 `targets()` 返回空列表 | `updateBoosts()` 因 `targets().isEmpty()` 提前 return → 同上 |
+| 关闭时干脆不调 `updateBoosts()` | 同上 |
+
+正确做法：`boosts()` / `targets()` 恒定返回完整集合，把条件放进 `canTarget(target)`：
+
+```java
+// 正确：条件只判在 canTarget，boosts()/targets() 与开关无关
+@Override public boolean canTarget(Building target) { return enabled && mode != modeOff; }
+@Override public Seq<Boost> boosts() { return boostList; }            // 恒定
+@Override public Seq<Building> targets() { return inRangeBuildings; } // 恒定（含关闭态）
+```
+
+参考实现：`EfficiencyControlTower`（`docs/blocks/EfficiencyControlTower.md`）——「关闭」模式下仍会做
+一次区域查询，正是为了能走通撤销路径。
+
+> 例外：`onRemoved()` 走 `removeProviderBoosts()`（`removeProvider`），那条路径**不**受上述限制，
+> 因为它主动遍历并清空该 Provider 的全部贡献。
 
 ## 版本历史
 
@@ -246,3 +293,6 @@ public class LubricantInjectorBuild extends Building implements BuildingBoostSys
 | a0.x | 强化信息消息标记 `.local()`：房主点击不再把详情广播给全服，严格仅点击者自己可见（`Message.local` + `MessageSync` 跳过广播） |
 | a0.x | 修复「只有最后一个按钮可点」：命中区槽位原用 `index`（boost 序号，每目标恒为 0）导致所有按钮共用一个 `Hit` 互相覆盖，改为按本帧按钮计数游标 `hitCursor` 分配 |
 | a0.x | 按钮改为**按光标距离动态淡入**（取代悬停高亮/放大）：不透明度 `0.4×(1−dist/24px)` 线性变化，超出 3 格不渲染按钮与图标；命中区回归视觉尺寸 4×4px（移除 `hitSize` 放大与 `hoverScale`，保证可见即可点） |
+| a0.x | 新增钩子式效果范式与 `isActive(target, boostId)`（零分配 O(1)）：供效果在「引擎钩子被回调时」查询自身生效状态。新增首个钩子式效果 `EnergySavingBoost`（`docs/boosts/EnergySavingBoost.md`）+ 通用钩子工具 `BlockConsumerHooks`；新增「1b. 钩子式效果」示例章节 |
+| a0.x | 名单 `boostableTypes` 追加工厂 `GenericCrafterBuild`（原仅炮塔）；新增「⚠ Provider 作者必读：想让效果停掉时只能靠 `canTarget()`」——记录撤销贡献的唯一路径（`boosts()`/`targets()` 恒定返回完整集合，条件只判 `canTarget`），避免开关类 Provider 出现贡献永不撤销的卡死 |
+| a0.x | 互斥裁决**保持**「优先级 + 效果 id 字典序」的纯函数排序键（曾短暂试过按提供者建筑 id 实现「先放置者胜」，已撤回）：字典序两端必然一致，且结果与放置顺序/玩家操作时序无关，不会因「谁先放」而改变；例：节能(`energy_saving`) 与 超频(`overclock`) 冲突时恒为节能胜出 |
