@@ -25,6 +25,7 @@ import mindustry.ui.dialogs.SettingsMenuDialog;
 import silicon.content.block.Blocks;
 import silicon.content.item.Items;
 import silicon.util.BoostOverlay;
+import silicon.util.BuildingBoostSystem;
 import silicon.util.MessageSync;
 import silicon.util.MessageSystem;
 import silicon.util.SiliconLog;
@@ -98,6 +99,9 @@ public class Silicon extends Mod {
             SignalSource.markDirty();
             SignalRelay.markDirty();
             // PowerProtector 无全局静态状态，数据随存档保存，无需重置
+            // 建筑强化系统的四张状态表以 Building 为键，会把整张旧地图钉在内存里；
+            // 且新图若无强化器则 flushFrame 根本不跑，旧建筑会继续被画强化徽记。必须清。
+            BuildingBoostSystem.reset();
         });
 
         BlockSearch.init();

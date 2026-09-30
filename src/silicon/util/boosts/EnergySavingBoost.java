@@ -95,9 +95,11 @@ public class EnergySavingBoost implements BuildingBoostSystem.Boost, BlockConsum
      * @param level 档位（自 1 起；越界夹到最近合法档）
      */
     public String summary(int level){
-        int i = BuildingBoostSystem.levelIndex(level, powerScales.length);
+        // 逐表独立取档（levelValue），不用「一张表算出的下标去索引另一张表」：
+        // 三张倍率表都是 public 可变字段，长度不一致时那种写法会抛 AIOOBE。
         return Core.bundle.format("boost.energy_saving.bonus",
-            BuildingBoostSystem.percentText(powerScales[i] - 1f), BuildingBoostSystem.percentText(speedScales[i] - 1f));
+            BuildingBoostSystem.percentText(BuildingBoostSystem.levelValue(powerScales, level) - 1f),
+            BuildingBoostSystem.percentText(BuildingBoostSystem.levelValue(speedScales, level) - 1f));
     }
 
     // 目标过滤：耗电工厂。consPower != null 即「该方块类型登记了电力 consumer」（PowerGraph 汇总需求时只认它），

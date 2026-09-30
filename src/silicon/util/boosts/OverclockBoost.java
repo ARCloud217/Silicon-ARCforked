@@ -117,10 +117,15 @@ public class OverclockBoost implements BuildingBoostSystem.Boost, BlockConsumerH
      * @param level 档位（自 1 起；越界夹到最近合法档）
      */
     public String summary(int level){
-        int i = BuildingBoostSystem.levelIndex(level, speedScales.length);
+        // 逐表独立取档（levelValue），不用「一张表算出的下标去索引另一张表」：
+        // 三张表都是 public 可变字段，长度不一致时那种写法会抛 AIOOBE。
+        // 掉血表另走显式判空（空表 = 不掉血，印 0 而不是 levelValue 的默认 1f）。
+        float damage = damageRates.length == 0 ? 0f
+            : damageRates[BuildingBoostSystem.levelIndex(level, damageRates.length)];
         return Core.bundle.format("boost.overclock.bonus",
-            BuildingBoostSystem.percentText(speedScales[i] - 1f), BuildingBoostSystem.percentText(powerScales[i] - 1f),
-            (int)damageRates[i]);
+            BuildingBoostSystem.percentText(BuildingBoostSystem.levelValue(speedScales, level) - 1f),
+            BuildingBoostSystem.percentText(BuildingBoostSystem.levelValue(powerScales, level) - 1f),
+            (int)damage);
     }
 
     // 目标过滤与节能完全一致：耗电工厂（consPower != null 且 GenericCrafter）
@@ -161,6 +166,12 @@ public class OverclockBoost implements BuildingBoostSystem.Boost, BlockConsumerH
     public void remove(Building target){
         // 清理每建筑计时，避免表项随建筑增删无限增长
         damageTimers.remove(target);
+    }
+
+    /** 换图/读档：清空掉血计时表（其键是 Building，会把旧世界钉在内存里）。 */
+    @Override
+    public void onWorldReset(){
+        damageTimers.clear();
     }
 
     // 与「节能」互斥：同一概念的两个相反档位，不应叠加（否则 0.8×1.75、0.9×1.5 得 hybrids）

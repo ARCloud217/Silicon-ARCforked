@@ -35,8 +35,9 @@
 | `description()` | **简要强化描述**（本地化），一句话说明收益，如「+100% 旋转速度；+20% 攻击速度」。**每个 Boost 必须实现**；数值须与实际生效值一致 |
 | `canTarget(target)` | **目标过滤**（写在各 Boost 里，System 登记前读取）：只接受本效果能作用的对象（如只收炮塔），默认放行 |
 | `shouldApply(target)` | 触发条件（无副作用，每帧询问） |
-| `apply(target)` | 生效（激活期间每 tick 一次） |
+| `apply(target)` | 生效（激活期间**每 tick 一次**，且**只能**由 `flushFrame` 这一个入口触发——见「不叠加规则」） |
 | `remove(target)` | 撤销（失格/被顶替/目标失效时一次） |
+| `onWorldReset()` | 换图/读档时清本效果自持的静态状态，**默认空实现**。仅自持静态表的效果需覆写（如 `OverclockBoost` 的掉血计时表，其键为 `Building`，不清会泄漏旧世界） |
 | `priority()` | 互斥优先级，数值大者胜，默认 0 |
 | `conflictsWith(otherId)` | 互斥声明：与指定效果是否冲突。冲突裁决**同级按效果 id 字典序**（纯函数、与放置顺序无关，两端必然一致） |
 | `name()` / `description()` | 显示名 / 描述（无目标）。多档位效果的 `description()` 返回**全部档位**作参考 |
@@ -148,21 +149,48 @@
 因此每 tick 至多 `apply` 一次（如同「两个一样的 buff 不会并存」）。效果**持续由强化器控制**：只要还有强化器在提供
 就保持生效；提供方全部撤走 / 强化器失效 / 目标失格时才 `remove`。
 
+> ### ⚠ `apply` 的唯一入口是 `flushFrame`（这条契约被破过一次）
+>
+> 「每 tick 至多 apply 一次」**不能只靠 `flushedTick` 守卫守住**——守卫只保护了「谁先触发冲洗」，
+> 而 `reconcile` 有**两个**调用点：
+>
+> | 调用点 | 触发时机 | 是否允许 `apply` |
+> |---|---|---|
+> | `flushFrame()` | 每 tick 一次（有 `flushedTick` 守卫） | **是（唯一入口）** |
+> | `removeProviderContributions()` | 拆强化器时**即时**（**无守卫**） | **否** |
+>
+> 曾因第二处也调 `reconcile` 而留下真实漏洞：**拆掉一台注入器** → `onRemoved()` →
+> `removeProviderBoosts()` → `removeProvider()` → `removeProviderContributions()` →
+> 对「该目标上仍有其他提供者」的效果**在同一 tick 再 `apply` 一次**。因为注入式效果是
+> 「每 tick 追加一份」，两次就等于**双倍**：转角每 tick 推两格、充能/生产进度加两份、掉血多记一次。
+> 且拆了又放回去可以反复触发，等价于**可刷产量/转角**。
+>
+> 现已由 `reconcile(target, tmap, allowApply)` 参数强制区分：`flushFrame` 传 `true`、
+> 即时重算路径传 `false`（只撤销、不应用）。
+> **新增第三条即时重算路径时，务必传 `false`。**
+
 ## 生命周期兜底
 
 - `sweepInvalid()`：**每 tick 一次**（随 `flushFrame` 触发，不再每强化器每帧各跑一遍），扫 `active`/`contributors`/`suppressed`，目标已失效/拆除时调 `removeBuilding()`——撤销该目标仍生效的效果并清光全部状态；同时扫 `providerSet`，强化器本机已失效的调 `removeProvider()` 清掉贡献——**不留残留、不漏撤销**。
 - `removeProvider(provider)`：**即时**撤销该强化器对全部目标的贡献并重算受影响目标（在 Build.`onRemoved()` 里经默认方法 `removeProviderBoosts()` 调用，也可由清扫兜底触发），防止拆除后贡献残留在状态表里。
+- `reset()`：**换图/读档时清空全部状态表**（已挂在 `EventType.WorldLoadEvent`，见 `Silicon.java`）。**换图必须清**，原因有两条，都不能靠 `sweepInvalid()` 兜住：
+  1. **内存泄漏**：`Building → Tile → World` 是强引用链，四张表不清就把**整张旧地图**钉在内存里。
+  2. **幽灵徽记**：`Building.isValid()` 的实现是 `tile != null && tile.build == this && !dead()`——
+     旧世界的建筑**仍然通过**校验。而新图若无强化器，`flushFrame()` 根本不会被触发
+     （它由强化器的 `update()` 驱动），`sweepInvalid()` 也就永不执行，旧建筑会继续被 `drawBoosts()` 画徽记。
+  - 附带把 `flushedTick` 复位，使新世界第一个 tick 重新触发一次冲洗。
+  - 各 `Boost` 自持的静态表经新增的 `Boost#onWorldReset()` 回调清理（默认空实现；如 `OverclockBoost` 的掉血计时表）。
 
 ## 性能与资源约定
 
 | 点 | 做法 |
 |----|------|
-| 每帧分配 | 登记路径**零分配**：仅在成员真正增删时创建内层容器；`flushBuffer`/`affectedBuffer`/`idBuffer` 等暂存集合全部复用 |
+| 每帧分配 | 登记路径**零分配**：仅在成员真正增删时创建内层容器；`flushBuffer`/`affectedBuffer`/`idBuffer`/`badTargets`/`badProviders` 等暂存集合**全部为静态复用**（含 `sweepInvalid` 的两个容器——早前每 tick `new` 会与本表宣称的「零分配」矛盾） |
 | 快照 | `active` 生效表**原地更新**，不再每 tick 为每个目标新建快照 Map |
 | 清扫 | `sweepInvalid` 由每帧 N 次（每强化器一次）降为**每 tick 1 次** |
-| 互斥 | 效果数 ≤ 1 走快速路径，跳过排序与临时 Seq/Map |
-| 迭代 | `ObjectMap`/`ObjectSet` 一律「先收集再删除」（`keys()` 依赖内部数组，边遍历边 remove 会抛并发修改异常）；用可复用缓冲中转 |
-| Provider 侧 | `targets()`/`boosts()` 返回 `Seq` 走下标遍历；实现方应缓存复用（注入器按 tick 重建并复用炮塔缓存，扣油阶段共用同一份） |
+| 互斥 | 效果数 ≤ 1 走快速路径，跳过排序与临时 Seq/Map（候选 > 1 时的 `next`/`ids`/`keep` 仍是临时对象，但只在该分支发生） |
+| 迭代 | `ObjectMap`/`ObjectSet` 一律「先收集再删除」（`keys()` 依赖内部数组，边遍历边 remove 会抛并发修改异常）；用可复用缓冲中转。**包括回调第三方代码的场合**——`removeBuilding()` 先把 id 收进 `idBuffer` 再回调 `boost.remove()`，否则第三方 `remove()` 反过来动状态表就会炸 |
+| Provider 侧 | `targets()`/`boosts()` 返回 `Seq` 走下标遍历；实现方应缓存复用（注入器按 tick 重建并复用炮塔缓存，扣油阶段共用同一份）。两者返回 `null` 均按「不提供/无目标」安全降级，不抛异常 |
 | 渲染 | `BoostOverlay` 每帧只算一次视野矩形；按钮 4px 固定故不会超出方块轮廓；按光标距离**分段**淡入（≤2 格恒 80%，2~10 格线性降到 0，超出 10 格不渲染，同时省去绘制）；命中区按索引复用；无面板 UI（详情走消息面板，零 UI 开销） |
 
 ## 多人 / 队伍安全
@@ -213,8 +241,10 @@
 | `sameTeam(Building, Building)` | 同队判定 |
 | `get(id)` | 注册表按 id 取效果 |
 | `register(Boost)` | 自动注册效果（加载期调用，重复 id 覆盖） |
-| `levelIndex(level, length)` | 档位（自 1 起）→ 倍率表下标，越界夹到最近合法档。**保证返回值合法**，故查倍率表时无需判空 |
-| `percentText(ratio)` | 倍率 → 百分比文本（`0.2f` → `"-20%"`），供加成文案统一格式化 |
+| `levelIndex(level, length)` | 档位（自 1 起）→ 倍率表下标，越界夹到最近合法档。**仅在 `length >= 1` 时保证返回值合法** |
+| `levelValue(table, level)` | 按档位取倍率表的值，等价 `table[levelIndex(level, table.length)]`，但**表为空时回落 `1f`（不改变任何量）**而不抛越界。倍率表是各效果上的 public 可变字段，被别的 mod 置空时不应让游戏崩在这种地方——**倍率表一律走本方法，不要用 `levelIndex` 的下标去索引另一张表**（长度不一致即 AIOOBE） |
+| `percentText(ratio)` | 倍率差 → 百分比文本，**符号与数值一致**（`0.5f` → `"+50%"`，`-0.2f` → `"-20%"`）。**调用方须传带符号差值 `scale - 1f`**：节能为负、超频为正。本方法只加符号、**不反转** |
+| `reset()` | **换图/读档清空全部状态表**（已挂 `WorldLoadEvent`）。必须清的理由见「生命周期兜底」——`isValid()` 放行旧世界建筑，清扫兜不住 |
 | `activeBoosts(target)` | 查目标当前生效的**效果单元列表**（`Seq<Boost>`，每次新建，**仅供点击/开面板等低频路径**，勿放每帧循环） |
 | `hasActiveBoosts(target)` | 目标是否还有生效强化（零分配，供每帧轮询） |
 | `isActive(target, boostId)` | 指定效果当前是否生效（零分配 O(1)）。**供「引擎钩子」在被引擎回调时查询自身倍率**——钩子不能缓存每建筑状态（缓存会产生两端不同步窗口） |
@@ -337,3 +367,4 @@ System 撤销某个 Provider 贡献的**唯一**路径是：该 Provider 仍被 
 | a0.x | 合并小工具类进 System：原独立的 `boosts.BoostBadge` / `boosts.BoostText` 迁入本类，成为 `BuildingBoostSystem.badgeIcon()` / `levelIndex(level, length)` / `percentText(ratio)`，两个文件删除（`boosts` 包只剩 `BlockConsumerHooks` 与三个效果实现） |
 | a0.x | 徽记淡入改为**分段**：≤2 格恒定 80%（`maxAlpha` 0.4→0.8，新增 `nearDistance` = 2 格）、2~10 格线性衰减到 0（`fadeDistance` 3 格→10 格）、超出 10 格不渲染 |
 | a0.x | **自检修复**（多人/健壮性）：① `levelOf` 多提供者裁决键由「建筑 `id` 最小」改为「`(tileX, tileY)` 字典序最小」，移除对 `EntityGroup.nextId()` 本地分配这一未验证量的依赖（详见「档位裁决为什么不用建筑 id」）；② `BoostOverlay.checkInput` 命中失效条目时由 `return` 改为 `continue`——原先一个恰好盖住光标的失效条目会吞掉整次点击，导致其后真正命中的徽记点不到（徽记密集时尤其明显）；③ `EfficiencyControlTower.drawPlace` 补 `Vars.player == null` 保护（无头/专服渲染时 `Vars.player.team()` 会 NPE），此时退回按「可放置」显示、不做重叠判定；④ `BoostOverlay.postBoostInfo` 补 `target.block == null` 保护；⑤ 新增 `levelValue(table, level)` 并让两个效果的 `FactorSource` 走它——倍率表被置空时回落 `1f` 而非抛数组越界，`OverclockBoost.apply` 的提速/掉血同样加空表保护（空表 = 既不提速也不掉血） |
+| a0.x | **采纳外部评审（rt334，实现层）**共 8 条、驳回 1 条：①【阻塞·已修】`reconcile` 的 apply 分支无条件调用，而它有**两个**调用点、只有 `flushFrame` 带 `flushedTick` 守卫：拆强化器 → `onRemoved` → `removeProviderContributions` → 同 tick 对「仍有其他提供者」的效果**再 apply 一次**，注入式效果双倍（转角两格/充能两份/多记一次掉血），且拆了又放回可反复触发＝可刷产量。改为 `reconcile(target, tmap, allowApply)`，`flushFrame` 传 `true`、即时重算路径传 `false`；②【高·已修】四张状态表以 `Building` 为键且全类**无任何 `Events.on`**——`Building → Tile → World` 强引用链会把整张旧地图钉在内存，且 `isValid()`（`tile != null && tile.build == this && !dead()`）**放行旧世界建筑**，新图无强化器时 `flushFrame` 不跑 ⇒ `sweepInvalid` 也不跑 ⇒ 旧建筑继续被画徽记。新增 `reset()` 并挂 `EventType.WorldLoadEvent`（`Silicon.java`），含 `flushedTick` 复位与新增的 `Boost#onWorldReset()` 回调（`OverclockBoost` 覆写以清掉血计时表）；③【中·已修】`sweepInvalid` 每 tick `new ObjectSet`/`new Seq` 改为静态复用 `badTargets`/`badProviders`；④【中·已修·修正建议写法】`BoostOverlay.checkInput` 缺 UI 焦点判定：本钩子跑在输入阶段、**早于 Scene 消费点击**，故在建造菜单/消息面板上点到光标下徽记仍会投递消息。补 `Core.scene.hasMouse()`——**不能用评审建议的 `hasMouse(wx, wy)`**：该重载走 `Scene.hit(x,y)`，要求**控件局部坐标**，传世界坐标无意义（无参版才是 `getHoverElement() != null`）；⑤【中·已修】`LubricantBoost` 攻速注入条件比引擎 `handleReload` 宽：引擎是 `if(!reloadWhileCharging && charging()) return; if(reloadCounter >= reload) return;`，而本注入只看 `isShooting()`——**已充满**的炮塔每 tick 仍被注入，而 `updateShooting` 减去 `reload` 后**保留溢出**，溢出累积成「补弹瞬间连发」的蓄力 bursts，实际收益远超文案 `+20%`；充能中的炮塔也会被推进。新增 `canEngineReload()` 逐条镜像引擎守卫；⑥【低·已修】`summary()` 用「一张表算出的下标索引另一张表」（三张 public 可变表长度不一致即 AIOOBE），改为逐表走 `levelValue`；⑦【低·已修】`Provider.boosts()` 缺 null 判（`targets()` 有），第三方返回 null 会 NPE；⑧【低·已修】`removeBuilding` 是唯一「边遍历 `map.keys()` 边回调第三方 `boost.remove()`」的路径，改走 `idBuffer` 先收集。**驳回**：`Hit.target` 从不置空 alleged 泄漏——`hits.clear()` 每帧执行，引用当帧即释放，且有 `isValid()` 兜底，非缺陷 |

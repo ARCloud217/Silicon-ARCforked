@@ -181,6 +181,13 @@ public class BoostOverlay implements BuildingBoostSystem.VisualRenderer {
     private static void checkInput() {
         if (Vars.state == null || !Vars.state.isGame()) return;
         if (!Core.input.keyTap(KeyCode.mouseLeft)) return;
+        // 光标悬在 UI 元素上时不响应：本钩子跑在输入阶段（Trigger.update），
+        // **早于 Scene 消费这次点击**，因此此刻还没人「吃掉」它——
+        // 不加这道门禁，在建造菜单/消息面板上点到光标下的徽记矩形仍会投递消息。
+        // 用无参 hasMouse()（= getHoverElement() != null，取上一帧绘制时的悬停元素）；
+        // 不可用 hasMouse(x, y)：那个重载走 Scene.hit(x, y)，要求的是 **控件局部坐标**，
+        // 传世界坐标会得到无意义的结果。
+        if (Core.scene.hasMouse()) return;
         float wx = Core.input.mouseWorldX(), wy = Core.input.mouseWorldY();
         for (Hit hit : hits) {
             if (!hit.rect.contains(wx, wy)) continue;

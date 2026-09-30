@@ -4,6 +4,7 @@ import arc.Core;
 import arc.math.Angles;
 import mindustry.gen.Building;
 import mindustry.world.blocks.defense.turrets.BaseTurret;
+import mindustry.world.blocks.defense.turrets.ReloadTurret;
 import mindustry.world.blocks.defense.turrets.Turret;
 import silicon.util.BuildingBoostSystem;
 
@@ -12,8 +13,10 @@ import silicon.util.BuildingBoostSystem;
  * 包含两个子效果——每个子效果的生效条件独立判定，激活期间每帧调用 apply 时各自按需注入：
  *
  * <ul>
- *   <li><b>攻速</b>：炮塔 {@code isShooting()} 时，按强化液方式注入充能点数
- *       {@code reloadCounter += firePotency × edelta() × ammoReloadMultiplier}（与强化液同加法池）;</li>
+ *   <li><b>攻速</b>：炮塔 {@code isShooting()} <b>且引擎本 tick 也会推进充能</b>时，按强化液方式注入
+ *       充能点数 {@code reloadCounter += firePotency × edelta() × ammoReloadMultiplier}（与强化液同加法池）;
+ *       充能守卫见 {@link #canEngineReload}——必须与引擎 {@code handleReload} 一致，否则已充满的炮塔
+ *       会累积溢出量、形成补弹瞬间连发的蓄力 bursts；</li>
  *   <li><b>转角</b>：炮塔 {@code hasAmmo() && shouldTurn()} 时，与引擎 turnToTarget 同式再推一格，
  *       目标角随引擎分支同源（玩家控制=unit 瞄准角、逻辑控制=logic 写入的 targetPos、
  *       自动索敌=targetPosition(target) 预测点），否则与引擎目标不一致会互相抵消。</li>
@@ -75,7 +78,13 @@ public class LubricantBoost implements BuildingBoostSystem.Boost {
         boolean hasAmmo = t.hasAmmo();
 
         // —— 攻速子效果：仅攻击中的炮塔 ——
-        if (shooting) {
+        // 注入条件必须与引擎的充能守卫一致，否则会把炮塔推进到「引擎自己不会推进」的状态：
+        //   handleReload(){ if(!reloadWhileCharging && charging()) return;
+        //                   if(reloadCounter >= reload) return; updateReload(); }
+        // 少了后一条时，已充满的炮塔每 tick 仍被注入，而 updateShooting 减去 reload 后**保留溢出**，
+        // 溢出量会累积成「蓄力 bursts」——补弹瞬间连发，实际收益远高于文案写的 +20%。
+        // 少了前一条时，充能中的炮塔（激光/液流）也会被推进，破坏 charging() 语义。
+        if (shooting && canEngineReload(t)) {
             float ammoRM = hasAmmo ? t.peekAmmo().reloadMultiplier : 1f;
             t.reloadCounter += firePotency * t.edelta() * ammoRM;
         }
@@ -102,6 +111,22 @@ public class LubricantBoost implements BuildingBoostSystem.Boost {
     @Override
     public void remove(Building target) {
         // 注入式：条件消失即自动失效，无需还原
+    }
+
+    /**
+     * 引擎本 tick 是否会推进充能——逐条镜像 {@code ReloadTurret.ReloadTurretBuild#handleReload} 的守卫：
+     * <pre>
+     * if(!reloadWhileCharging &amp;&amp; charging()) return;
+     * if(reloadCounter &gt;= reload)          return;
+     * </pre>
+     *
+     * <p>{@code reloadWhileCharging} 声明在 {@link Turret} 上（{@code reload} 继承自
+     * {@link ReloadTurret}），{@code reloadCounter} / {@code charging()} 是建筑字段；
+     * 这里按引擎同样的取值来源读取。非 {@link Turret} 派生（无充能概念）返回 false。
+     */
+    private static boolean canEngineReload(Turret.TurretBuild t){
+        if(!(t.block instanceof Turret block)) return false;
+        return (block.reloadWhileCharging || !t.charging()) && t.reloadCounter < block.reload;
     }
 
     @Override

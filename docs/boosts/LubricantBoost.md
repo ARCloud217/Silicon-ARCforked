@@ -28,11 +28,36 @@
 | 项 | 值 |
 |----|----|
 | 数值 | `firePotency = 0.2f`（+20% 射速） |
-| 触发条件 | 炮塔 `isShooting()`（正在攻击） |
+| 触发条件 | 炮塔 `isShooting()`（正在攻击）**且引擎本 tick 也会推进充能**（`canEngineReload`，见下） |
 | 注入方式 | `reloadCounter += firePotency × edelta() × ammoRM` |
 
 - `ammoRM` = 有弹药时 `peekAmmo().reloadMultiplier`，否则 `1`。
 - 与**原版强化液同一加法池**（不是乘法），因此可与强化液叠加；原版超速（overdrive）对该池整体再乘。
+
+> #### ⚠ 注入条件必须与引擎的充能守卫一致（这条曾被评审指出并修正）
+>
+> 引擎 `ReloadTurret.ReloadTurretBuild#handleReload` 的守卫是：
+>
+> ```java
+> if(!reloadWhileCharging && charging()) return;
+> if(reloadCounter >= reload)          return;
+> updateReload();   // reloadCounter += delta * ammoReloadMultiplier * baseReloadSpeed
+> ```
+>
+> 早前本注入**只看 `isShooting()`**，比引擎宽，后果有二：
+>
+> 1. **已充满的炮塔每 tick 仍被注入**。而 `updateShooting` 开火后是 `reloadCounter -= reload`、
+>    **保留溢出量**——溢出不断累积，形成「蓄力 bursts」：炮塔可以先攒一整仓，缺弹期间照样每 tick 进账，
+>    补弹瞬间连发多发。实际收益远高于文案写的 `+20%`。
+> 2. **充能中的炮塔**（`charging()`，如激光/液流炮）也被推进，破坏 `charging()` 语义。
+>
+> 现由 `canEngineReload(t)` 逐条镜像上述守卫（`reloadWhileCharging` 在 `Turret` 上、`reload` 继承自
+> `ReloadTurret`、`reloadCounter`/`charging()` 是建筑字段），非 `Turret` 派生的方块返回 `false`。
+>
+> > 另注：`baseReloadSpeed()` 是 `protected`，外部无法调用，故注入量用的是
+> > `firePotency × edelta() × ammoRM` 而非引擎的 `delta() × ammoRM × baseReloadSpeed`。
+> > 因此 `+20%` 是**相对 `baseReloadSpeed == 1` 的基准炮塔**成立的——装填速度更快的炮塔拿到的
+> > 相对增益更低。这是已知取舍，非 bug。
 
 ### 转角（×2）
 
@@ -98,3 +123,4 @@
 | 版本 | 变更 |
 |------|------|
 | a0.x | 初始实现：攻速 +20%（强化液同池加法）、转角 ×2（目标角与引擎三分支同源）、`canTarget` 限炮塔、`visual` 用原版 overclock 状态图标、`name`/`description` 走 bundle |
+| a0.x | **攻速注入条件对齐引擎**（外部评审 rt334）：新增 `canEngineReload(t)` 镜像 `ReloadTurret#handleReload` 的 `if(!reloadWhileCharging && charging()) return; if(reloadCounter >= reload) return;`——原先只看 `isShooting()`，会让**已充满**的炮塔每 tick 仍被注入，而 `updateShooting` 保留溢出量，累积成「补弹瞬间连发」的蓄力 bursts（实际收益远超文案 `+20%`），且会推进 `charging()` 中的炮塔。附带记录 `baseReloadSpeed()` 为 `protected` 不可调用，故 `+20%` 以 `baseReloadSpeed == 1` 为基准 |

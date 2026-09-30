@@ -104,6 +104,9 @@ public final class BuildingBoostSystem {
     private static final Seq<Building> affectedBuffer = new Seq<>();
     /** 撤销/回收 id 暂存缓冲（复用；ObjectMap 边遍历边 remove 会抛并发修改异常，须先收集）。 */
     private static final Seq<String> idBuffer = new Seq<>();
+    /** 清扫缓冲：失效目标 / 失效强化器（复用，避免每 tick 新建）。 */
+    private static final ObjectSet<Building> badTargets = new ObjectSet<>();
+    private static final Seq<Provider> badProviders = new Seq<>();
 
     /** 已冲洗本 tick 的标记（按世界 tick 归组，保证一帧只统一裁决一次）。 */
     private static double flushedTick = Double.MIN_VALUE;
@@ -115,6 +118,35 @@ public final class BuildingBoostSystem {
         boostableTypes.add(Turret.TurretBuild.class);
         // 工厂：供「节能」等工厂类效果（见 EfficiencyControlTower / EnergySavingBoost）
         boostableTypes.add(GenericCrafter.GenericCrafterBuild.class);
+    }
+
+    /**
+     * **世界级重置**：清空全部静态状态表。
+     *
+     * <p><b>换图/读档必须调用</b>（已挂在 {@code EventType.WorldLoadEvent} 上）。
+     * 本类的四张表都以 {@link Building} 为键，而 {@code Building → Tile → World} 构成强引用链：
+     * 不清理会把<b>整张旧地图</b>钉在内存里出不来。更糟的是「新图里没有强化器」时
+     * {@link #flushFrame()} 根本不会被触发（它由强化器的 update 驱动），
+     * 于是 {@link #sweepInvalid()} 也不会跑——旧建筑会继续被画上强化徽记。
+     *
+     * <p>注意：只清本类状态；各 {@link Boost} 自持的静态表（如超频的掉血计时）
+     * 由其 {@link Boost#onWorldReset()} 自行清理，第三方实现不清理也不会残留建筑引用。
+     */
+    public static void reset() {
+        contributors.clear();
+        suppressed.clear();
+        active.clear();
+        providerSet.clear();
+        flushBuffer.clear();
+        affectedBuffer.clear();
+        idBuffer.clear();
+        badTargets.clear();
+        badProviders.clear();
+        // 让新世界的第一个 tick 重新触发一次 flushFrame（否则 flushedTick 仍是旧世界的值）
+        flushedTick = Double.MIN_VALUE;
+        for (Boost boost : registry.values()) {
+            boost.onWorldReset();
+        }
     }
 
     /**
@@ -194,8 +226,20 @@ public final class BuildingBoostSystem {
         /** 生效：激活期间每帧调用一次（同目标同效果每帧至多一次，不叠加）；实现需符合注入式/引用式约定。 */
         void apply(Building target);
 
-        /** 撤销：失格 / 被互斥顶替 / 目标或强化器失效时由 System 调用，必须可还原、不得残留。 */
-        void remove(Building target);
+    /** 撤销：失格 / 被互斥顶替 / 目标或强化器失效时由 System 调用，必须可还原、不得残留。 */
+    void remove(Building target);
+
+    /**
+     * 换图/读档时由 {@link #reset()} 调用一次，用于清理本效果自持的静态状态。
+     *
+     * <p><b>默认空实现</b>：绝大多数效果无状态（注入式随条件自动失效），无需处理。
+     * 只有自持静态表的效果才需要覆写——如超频的「每建筑掉血计时」表，
+     * 否则换图后残留旧世界的建筑键（内存泄漏 + 掉血速率错配）。
+     *
+     * <p>实现约定：只清自己的状态，<b>不要</b>调用 System 的表（{@link #reset()} 已在清）。
+     */
+    default void onWorldReset() {
+    }
 
         /** 互斥优先级：与其它效果的冲突裁决用，数值大者胜。默认 0。 */
         default int priority() {
@@ -587,6 +631,9 @@ public final class BuildingBoostSystem {
         ObjectMap<String, ObjectSet<Provider>> targetContributors = contributors.get(target);
 
         Seq<Boost> boosts = provider.boosts();
+        if (boosts == null) {
+            return; // 第三方 Provider 返回 null：当作「本机不提供任何效果」，不炸
+        }
         // 注：arc 的 Seq 在本引擎里 size 是 public 字段（无 size() 方法），故用 boosts.size
         for (int i = 0, n = boosts.size; i < n; i++) {
             Boost boost = boosts.get(i);
@@ -643,7 +690,7 @@ public final class BuildingBoostSystem {
         for (Building target : flushBuffer) {
             ObjectMap<String, ObjectSet<Provider>> tmap = contributors.get(target);
             resolveMutex(target, tmap);
-            reconcile(target, tmap);
+            reconcile(target, tmap, true); // 每 tick 唯一的 apply 路径
         }
 
         sweepInvalid();
@@ -722,13 +769,18 @@ public final class BuildingBoostSystem {
      * 应用/撤销：以「有人提供且未被挂起」为应生效集合——应生效的<b>每 tick 调用一次 apply</b>
      * （保证注入式逐帧累加、不叠加），不再应生效的调用一次 remove。
      * 生效状态表<b>原地更新</b>，不每 tick 新建快照对象。
+     *
+     * @param allowApply 是否允许本次调用执行 apply。<b>只有每 tick 一次的 {@link #flushFrame()} 传 true</b>；
+     *                   其余即时重算路径（{@link #removeProviderContributions}）必须传 false，
+     *                   否则同 tick 内会对同一目标重复 apply（注入式效果被叠加两次 =
+     *                   转角/充能/进度翻倍，且可反复触发刷量），违反本类的「一 tick 至多一次」契约。
      */
-    private static void reconcile(Building target, ObjectMap<String, ObjectSet<Provider>> tmap) {
+    private static void reconcile(Building target, ObjectMap<String, ObjectSet<Provider>> tmap, boolean allowApply) {
         ObjectMap<String, String> targetSuppressed = suppressed.get(target);
         ObjectMap<String, Boolean> state = active.get(target);
 
-        // 1) 应用：应生效集合逐个 apply（本 tick 一次）
-        if (tmap != null) {
+        // 1) 应用：应生效集合逐个 apply（仅每 tick 一次的驱动路径执行）
+        if (allowApply && tmap != null) {
             for (String id : tmap.keys()) {
                 if (count(tmap, id) <= 0) continue;
                 if (targetSuppressed != null && targetSuppressed.containsKey(id)) continue;
@@ -801,7 +853,9 @@ public final class BuildingBoostSystem {
                 contributors.remove(target); // 该目标已无任何贡献，回收条目
             }
             resolveMutex(target, tmap);
-            reconcile(target, tmap);
+            // 不 apply：这是「即时撤销」路径，本 tick 的 apply 已由 flushFrame 统一做过一次。
+            // 若这里再 apply 一次，同一目标同一 tick 会被 apply 两次（注入式效果翻倍）。
+            reconcile(target, tmap, false);
         }
         affectedBuffer.clear();
     }
@@ -810,15 +864,17 @@ public final class BuildingBoostSystem {
     private static void sweepInvalid() {
         // 先收集再删除：ObjectMap 的 keys() 迭代器依赖内部数组，
         // 边遍历边 remove 会抛并发修改异常/漏扫，故与强化器侧同样先收集后处理。
-        ObjectSet<Building> badTargets = new ObjectSet<>();
+        // 两个容器为静态复用，避免每 tick 新建。
+        badTargets.clear();
         collectInvalid(active.keys(), badTargets);
         collectInvalid(contributors.keys(), badTargets);
         collectInvalid(suppressed.keys(), badTargets);
         for (Building target : badTargets) {
             removeBuilding(target);
         }
+        badTargets.clear();
 
-        Seq<Provider> badProviders = new Seq<>();
+        badProviders.clear();
         for (Provider provider : providerSet) {
             Building pb = provider.building();
             if (pb == null || !pb.isValid()) {
@@ -828,6 +884,7 @@ public final class BuildingBoostSystem {
         for (Provider provider : badProviders) {
             removeProvider(provider);
         }
+        badProviders.clear();
     }
 
     private static void collectInvalid(Iterable<Building> keys, ObjectSet<Building> out) {
@@ -842,14 +899,21 @@ public final class BuildingBoostSystem {
     private static void removeBuilding(Building target) {
         ObjectMap<String, Boolean> map = active.get(target);
         if (map != null) {
+            // 先收集再回调：boost.remove() 是第三方代码，若它反过来动本类状态表，
+            // 边遍历 map.keys() 回调会抛并发修改异常。与本类其余清理路径保持同一口径。
+            idBuffer.clear();
             for (String id : map.keys()) {
                 if (Boolean.TRUE.equals(map.get(id))) {
-                    Boost boost = registry.get(id);
-                    if (boost != null) {
-                        boost.remove(target);
-                    }
+                    idBuffer.add(id);
                 }
             }
+            for (String id : idBuffer) {
+                Boost boost = registry.get(id);
+                if (boost != null) {
+                    boost.remove(target);
+                }
+            }
+            idBuffer.clear();
         }
         active.remove(target);
         contributors.remove(target);
