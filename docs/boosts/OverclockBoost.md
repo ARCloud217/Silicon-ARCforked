@@ -26,12 +26,59 @@
 
 ## 目标过滤
 
-与节能逐字相同（同一套判定，便于统一维护口径）：
-
 | 方法 | 行为 |
 |------|------|
-| `canTarget(Building)` | `block.consPower != null`（耗电）且 `block instanceof GenericCrafter`（工厂） |
-| `shouldApply(Building)` | `target.enabled`（工厂未被玩家关闭） |
+| `canTarget(Building)` | `block.consPower != null`（耗电）且 `block instanceof GenericCrafter`（工厂）——与节能逐字相同 |
+| `shouldApply(Building)` | `target.enabled && efficiency > 0 && warmup >= warmupThreshold`（**已启用 且 确实在运转**，带去抖；见下） |
+
+### 生效条件：必须「确实在运转」（带去抖）
+
+超频是「以寿命换产能」——**没产能就不该付代价**。若只判 `enabled`，工厂缺料/产物堵满时会
+照常掉血（且 3 档仍按 6 倍功率占用电网），玩家看到的是「什么都不产、却一直损血烧电」。
+
+`efficiency` 是引擎给出的权威「本帧是否在运转」信号，覆盖全部停机情形
+（已由 `Building.updateConsumption()` 字节码确认）：
+
+| 停机原因 | `efficiency` 归零的路径 | `shouldConsumePower` | 电网耗电 |
+|---------|----------------------|---------------------|---------|
+| 缺料 | 物品 consumer 的 `efficiency()` 返回 0 → 取最小值后归零 | **false** | ❌ 不计 |
+| 产物堵满 | `shouldConsume() == false` → 末尾显式置 0 | true | ✅ 仍计（超频撤销后降回标称） |
+| 断电 | `potentialEfficiency = 0` → 归零 | true | ✅ 仍计入需求 |
+| 被玩家关闭 | 整个分支置 0（`enabled` 另行显式判） | **false** | ❌ 不计 |
+
+> 上表由 `PowerGraph.getPowerNeeded()` 与 `Building.updateConsumption()` 的字节码确认：
+> 需求汇总的唯一门是 `shouldConsumePower`，而它仅在「非电力 consumer 的 `efficiency() <= 1e-7`」时置 false
+> （该判定显式跳过 `consPower` 自身，否则断电建筑会退出需求、导致供电震荡）。
+
+#### 去抖
+
+`efficiency` 会在缺料/来料交替时于 0/1 之间抖动，直接拿它当开关会让徽记与倍率每帧闪烁。
+故要求**引擎维护的平滑量 `warmup` 越过 `warmupThreshold`（默认 0.5）**：
+
+- **启动侧**：`warmup` 需爬升越过阈值才生效 → 滤掉瞬时抖动；
+- **停机侧**：`warmup` 在 `efficiency == 0` 时平滑衰减（`approachDelta(warmup, 0, warmupSpeed)`）
+  → 短暂缺料不会立刻撤销。
+
+`warmupSpeed = 0.019f`（每 tick 逼近 1.9%），故 0.5 阈值约需 `ln(0.5)/ln(1-0.019) ≈ 36` tick（约 0.6 秒），
+**两个方向都是这个量级**。
+
+**为何用引擎自带量而非自建计数器**：`shouldApply` 按契约必须是**无副作用**的纯查询，
+且同一目标可能被多台 Provider 各问一次（多台塔覆盖同一工厂时一 tick 问多次），自增计数器会重复计数。
+`warmup` 由引擎每 tick 推进一次、两端一致，天然满足这两条约束。
+
+#### 不会与电网形成震荡环
+
+超频是**增加**耗电的效果，撤销它只会让电网更宽裕，不存在「撤销 → 更缺电 → 更多撤销」的正反馈。
+（省电类效果才有那个方向的风险。这也是本判据能安全使用含断电项的 `efficiency`、
+而不像 `EnergySavingBoost` 那样回避它的原因。）
+
+#### 连带影响
+
+- **徽记随之下线**：`BoostOverlay` 的绘制判据是 `BuildingBoostSystem.hasActiveBoosts(target)`，
+  而该表由 `shouldApply` 驱动（`collectContributions` 内 `want = ... && boost.shouldApply(target)`）。
+  故停机时徽记消失、恢复时自动出现，与「是否真的在超频」严格一致。
+- **掉血计时随撤销清零**：`remove()` 里 `damageTimers.remove(target)`，故恢复供料时从零重新计时，
+  不会把停机期间的时间也算进去（否则会「一恢复就立刻扣一次」）。
 
 ## 子效果
 
@@ -169,6 +216,7 @@ crafter.progress += crafter.getProgressIncrease(craftTime) * (factor - 1f);
 | `powerScales` | float[] | `{1.3f, 2.25f, 6.0f}` | 各档耗电倍率（索引 0 = 1 级） |
 | `damageRates` | float[] | `{4f, 10f, 45f}` | 各档掉血**速率**（生命/秒，索引 0 = 1 级） |
 | `damageInterval` | float | `1f` | 扣血周期（秒）：每隔这么久扣一次「速率 × 周期」点生命；≤0 关闭扣血 |
+| `warmupThreshold` | float | `0.5f` | 去抖阈值：工厂 `warmup` 需达到该值才认为「确实在运转」。设为 0 即不去抖（只要 `efficiency > 0` 立即生效）；调大更稳但启停更迟滞 |
 
 倍率与扣血字段均为 `OverclockBoost.instance` 上的 public 字段，实时读取，可直接改。
 
@@ -180,3 +228,4 @@ crafter.progress += crafter.getProgressIncrease(craftTime) * (factor - 1f);
 | a0.x | **改为 3 档制 + 掉血改为速率语义**：`speedScales {1.5, 2.0, 4.0}` / `powerScales {1.3, 2.25, 6.0}` / `damageRates {4, 10, 45}`（生命/秒），`damageInterval` 改为 1s（周期 × 速率 = 每次扣血量）。档位由 Provider 持有、System 按目标回查；`FactorSource` 改为接收档位参数，`description()` 逐档拼装（bundle `boost.overclock.level`） |
 | a0.x | **修复「超频不加速」**：`efficiency` 恒 ≤ 1（`updateConsumption` 取非可选 consumer 最小值且初值为 1），故把倍率返回给 `SpeedTaxConsume` 对 >1 的档位<b>完全无效</b>——被物品/液体 consumer 的 1.0 取小顶掉（节能的 0.85 因小于 1 才正常）。改为 `BlockConsumerHooks.boostProgress`：向 `progress` 追加「超出 1 倍的那一份」（`progress` 归一化，`craft()` 内 `% 1` 结转，故不会溢出）。`SpeedTaxConsume.efficiency` 同时把倍率夹到 ≤ 1，使该限制在代码里显式可见 |
 | a0.x | 互斥裁决沿用「优先级 + 效果 id 字典序」（恒为节能胜出），未采用「先放置者胜」 |
+| a0.x | **修复「工厂未工作仍扣血」**：`shouldApply` 由仅判 `enabled` 改为 `enabled && efficiency > 0 && warmup >= warmupThreshold`——缺料/产物堵满/断电时不再掉血，也不再按超频倍率占用电网，徽记同步下线（`BoostOverlay` 读的 `active` 表由 `shouldApply` 驱动）。`efficiency` 的归零路径经 `Building.updateConsumption()` 字节码确认；去抖用引擎自带的 `warmup` 平滑量（双向各约 36 tick）而非自建计数器——`shouldApply` 须无副作用，且多 Provider 会重复调用。因超频是<b>增</b>耗电效果，撤销只会让电网更宽裕，不构成震荡环 |

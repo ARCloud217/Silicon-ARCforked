@@ -1,13 +1,22 @@
 package silicon.world.blocks.defense;
 
+import arc.Core;
+import arc.graphics.Color;
+import arc.graphics.g2d.Draw;
+import arc.graphics.g2d.TextureRegion;
+import arc.math.Mathf;
 import arc.struct.Seq;
 import arc.util.Time;
 import mindustry.Vars;
 import mindustry.gen.Building;
+import mindustry.graphics.Drawf;
 import mindustry.type.Liquid;
 import mindustry.world.Block;
 import mindustry.world.blocks.defense.turrets.Turret;
+import mindustry.world.blocks.liquid.LiquidBlock;
 import silicon.util.BuildingBoostSystem;
+import silicon.util.SiliconLog;
+import silicon.util.SiliconTmp;
 import silicon.util.boosts.LubricantBoost;
 
 import static silicon.content.liquid.Liquids.lubricant;
@@ -38,6 +47,33 @@ public class LubricantInjector extends Block {
     /** 每个正在攻击的受惠炮塔的润滑油消耗（单位/秒） */
     public float consumePerTurret = 5f;
 
+    // ========== 三层贴图 + 闪光层（命名沿用原版液体储罐 LiquidBlock 的约定）==========
+    /** 底座贴图（打底，覆盖整块 2x2） */
+    public TextureRegion bottomRegion;
+    /** 顶盖贴图（主体，绘制在闪光层之下） */
+    public TextureRegion topRegion;
+    /** 闪光层贴图：绘制在 {@link #topRegion} <b>之上</b>，用加色混合叠加 */
+    public TextureRegion lightRegion;
+
+    /** 液体边缘内缩间距（绘制流动液面时用，与原版液体储罐/两用存储器一致为 0） */
+    public float liquidPadding = 0f;
+
+    /**
+     * 闪光颜色：取模组润滑油的配色（{@code Liquids.lubricant} 的 {@code 8a5a2b} 深琥珀）。
+     *
+     * <p>两个要点：
+     * <ul>
+     *   <li>用 {@code cpy()} 而非直接引用 {@code Liquids.lubricant.color}——
+     *       这是可被外部改写的实例字段，直接引用会让「改本方块闪光色」连带改掉全局液体颜色。</li>
+     *   <li>alpha 压低到 0.35 而非默认 1：{@code Color.valueOf} 产出不透明色，
+     *       而加色混合下满 alpha 会过曝成白团、盖掉顶盖细节，故留出上限。</li>
+     * </ul>
+     */
+    public Color lightColor = Color.valueOf("8a5a2b").a(0.35f);
+
+    /** 闪光强度的淡入淡出速度（越大越快），对齐原版爆破钻头 {@code warmup} 的平滑风格。 */
+    public float glowSpeed = 0.08f;
+
     /** 本方块提供的效果单元列表：全方块共享一份只读 Seq，避免每帧每目标新建。 */
     private final Seq<BuildingBoostSystem.Boost> boostList = Seq.with(LubricantBoost.instance);
 
@@ -48,13 +84,65 @@ public class LubricantInjector extends Block {
         hasLiquids = true;
         outputsLiquid = false;
         liquidCapacity = 300f;
+
+        // 关键：本方块自绘三层贴图，必须每帧动态绘制。
+        // 若被烘焙进区块缓存（drawCached），动态闪光只会在缓存重建时刷新一次，工作时不会闪烁；
+        // 而对齐原版液体方块默认值（drawCached=false + drawDynamic=true）可保证只每帧动态画一次，
+        // 不会「进缓存 + 每帧再画」导致半透明叠加过饱和。
+        this.drawCached = false;
+        this.drawDynamic = true;
+    }
+
+    @Override
+    public void load() {
+        super.load();
+
+        // 三张贴图按 mod 约定命名（与原版 LiquidBlock 同口径：{name}-bottom / -top）。
+        // 目录 assets/sprites/blocks/lubricant-injector/ 不参与 atlas 键名。
+        bottomRegion = loadOrFallback("-bottom");
+        topRegion = loadOrFallback("-top");
+        lightRegion = loadOrFallback("-light");
+    }
+
+    /**
+     * 取分层贴图，缺失时回退主贴图并告警（与 {@code DualPurposeStorager} / 控制塔同款约定）。
+     *
+     * <p>{@code Core.atlas.find} 对缺失区域返回 error 占位图而非抛异常，
+     * 直接用会让整块糊成缺图且毫无提示，故显式拦截。
+     */
+    private TextureRegion loadOrFallback(String suffix) {
+        TextureRegion found = Core.atlas.find(name + suffix);
+        if (!found.found()) {
+            SiliconLog.warn("LubricantInjector '{}' missing {} texture, fallback to region", name, suffix);
+            return region;
+        }
+        return found;
     }
 
     public class LubricantInjectorBuild extends Building implements BuildingBoostSystem.Provider {
 
+        /** 液体「视为空」的阈值：与原版液体方块及两用存储器同口径（0.001）。 */
+        private static final float LIQUID_THRESHOLD = 0.001f;
+
         /** 紧贴炮塔缓存：按 tick 重建并复用同一 Seq（零分配，供 targets() 与扣油共用）。 */
         private final Seq<Building> turretCache = new Seq<>();
         private double cacheTick = Double.MIN_VALUE;
+
+        /**
+         * 闪光强度（0~1）：工作时升向 1，停机时落回 0。
+         *
+         * <p>平滑逼近（{@code approachDelta}）而非直接置位——阶跃会让闪光在开关瞬间硬切，
+         * 这与原版爆破钻头用 {@code warmup} 缓动是同一考虑。
+         */
+        public float glow = 0f;
+
+        /**
+         * 本帧是否确实在为至少一座炮塔提供强化（即「工作中」）。
+         *
+         * <p>由 {@link #update()} 每帧写入，是 {@link #glow} 的目标状态来源；
+         * 绘制阶段只读 {@link #glow}、不做任何扫描，避免把逐帧成本压到渲染路径上。
+         */
+        public boolean active = false;
 
         @Override
         public Building building() {
@@ -141,10 +229,11 @@ public class LubricantInjector extends Block {
             // 认领用与 canTarget 相同的确定性判定（owns）——与 System 登记口径一致，且客户端/服务器算出的
             // 认领者相同，扣的同一台机器的油，液体量不分歧（多人安全）。
             // 与攻速 Boost 的激活口径一致（isShooting）。无认领/无攻击时零消耗。
-            if (liquids.get(lubricant) > 0.001f) {
+            int provided = 0;
+            boolean hasOil = liquids.get(lubricant) > 0.001f;
+            if (hasOil) {
                 // 复用 targets() 的本 tick 缓存，不再重扫 proximity
                 Seq<Building> turrets = targets();
-                int provided = 0;
                 for (int i = 0, n = turrets.size; i < n; i++) {
                     Building b = turrets.get(i);
                     if (b instanceof Turret.TurretBuild t && t.isShooting()
@@ -157,6 +246,65 @@ public class LubricantInjector extends Block {
                     float held = liquids.get(lubricant);
                     float need = consumePerTurret * provided * Time.delta / 60f;
                     liquids.remove(lubricant, Math.min(need, held));
+                }
+            }
+
+            // 闪光状态与扣油同源（同一遍循环的两个产物）：存油且确有炮塔在受惠才算「工作」。
+            // 未工作时光强落回 0，故「没在起作用却一直闪」不会出现。
+            active = hasOil && provided > 0;
+
+            // 平滑逼近目标强度（0 或 1），避免开关瞬间硬切；与物理用 delta 而非帧数无关的常量。
+            glow = Mathf.approachDelta(glow, active ? 1f : 0f, glowSpeed);
+        }
+
+        /**
+         * 绘制：<b>四层</b>，自下而上依次为
+         * ①{@code bottom} 底 → ②<b>原版液体动画</b> → ③{@code top} 顶盖 → ④{@code light} 闪光。
+         *
+         * <p>基准图 {@code lubricant-injector.png} 不单独绘制——它是 `bottom + top + light` 的合成产物，
+         * 故四层画完即得基准图外观（液体层只在有油时出现，空罐时正好等于基准图）。
+         *
+         * <p><b>第 ② 层是原版液体动画</b>，与两用存储器/原版液体储罐同一入口
+         * （{@link LiquidBlock#drawTiledFrames}）：用引擎的 {@code fluidFrames} 动画帧画出条纹流动的液面，
+         * 并按液体自身的颜色着色、以填充比例作为 alpha（油多则浓、少则淡）。
+         *
+         * <p><b>画顶盖前必须重置颜色</b>：{@code drawTiledFrames} 内部经 {@code Drawf.liquid} 着色，
+         * 会在 {@code Draw} 上<b>残留液体颜色</b>；不重置就会把顶盖也染成油色。
+         * 这与两用存储器曾修复过的问题是同一处（其代码在画顶盖前有 {@code Draw.color(Color.white)}）。
+         *
+         * <p><b>闪光写法参照原版爆破钻头</b>（{@code BurstDrill} 的 glow 分支）：
+         * 用 {@link Drawf#additive} 而非普通绘制——加色混合才能得到「发光」而非「贴一层颜色」的观感。
+         * 该辅助方法内部已自行处理 {@code Draw.z}、颜色与 {@code Blending.additive} 的设置与复位，
+         * 故这里不需要（也不应该）再手动调 {@code Draw.blend}。
+         *
+         * <p>强度 = 平滑后的 {@code glow} × 正弦脉动：前者保证开关有缓动，后者给出持续闪烁的「呼吸」感。
+         * 两者相乘，故未工作（{@code glow → 0}）时脉动也被一并压到 0，无需额外分支。
+         */
+        @Override
+        public void draw() {
+            // ① 底座
+            Draw.rect(LubricantInjector.this.bottomRegion, x, y);
+
+            // ② 原版液体动画：有油才画，alpha 用填充比例（与原版液体储罐同口径，不做保底）
+            float amount = liquids.currentAmount();
+            Liquid current = liquids.current();
+            if (current != null && amount > LIQUID_THRESHOLD) {
+                LiquidBlock.drawTiledFrames(size, x, y, liquidPadding, current, amount / liquidCapacity);
+            }
+
+            // ③ 顶盖：先重置颜色，否则会被上一层残留的液体色染色
+            Draw.color(Color.white);
+            Draw.rect(LubricantInjector.this.topRegion, x, y);
+
+            // ④ 闪光层：仅在贴图存在且确有一定强度时绘制，避免空转
+            if (lightRegion.found() && glow > 0.001f) {
+                // absin 给出 [0,1] 的平滑振荡（值域已由字节码确认），乘 glow 得到本帧整体强度。
+                // 注意强度必须真正传给绘制——只算不用会让闪光恒定满亮、失去「闪烁」观感。
+                float intensity = Mathf.absin(Time.time, 6f, 1f) * glow;
+                if (intensity > 0.001f) {
+                    // 用本仓库的临时色对象（SiliconTmp，与 Switch 同款），避免每帧新建 Color。
+                    // lightColor 自身的 alpha 作为上限，再乘本帧强度。
+                    Drawf.additive(lightRegion, SiliconTmp.c1.set(lightColor).a(lightColor.a * intensity), x, y);
                 }
             }
         }

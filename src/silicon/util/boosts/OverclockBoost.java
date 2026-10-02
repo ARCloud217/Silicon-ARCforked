@@ -67,6 +67,15 @@ public class OverclockBoost implements BuildingBoostSystem.Boost, BlockConsumerH
     /** 扣血周期（秒）：每隔这么久扣一次「速率 × 周期」点生命。 */
     public float damageInterval = 1f;
 
+    /**
+     * 去抖阈值：工厂的 {@code warmup} 需达到该值才认为「确实在运转」（见 {@link #shouldApply}）。
+     *
+     * <p>取值考量：{@code warmupSpeed = 0.019f} 意味着每次逼近 1.9%，故 0.5 约需
+     * {@code ln(0.5)/ln(1-0.019) ≈ 36} tick（约 0.6 秒）——足以滤掉缺料/来料的瞬时交替，
+     * 又不会让正常启停有明显迟滞。调大更稳但更迟钝；设为 0 即「只要 efficiency > 0」立即生效（等于不去抖）。
+     */
+    public float warmupThreshold = 0.5f;
+
     /** 每建筑累计的扣血计时（秒）。在 remove() 中清理，见类注释。 */
     private static final ObjectMap<Building, Float> damageTimers = new ObjectMap<>();
 
@@ -135,10 +144,47 @@ public class OverclockBoost implements BuildingBoostSystem.Boost, BlockConsumerH
         return block != null && block.consPower != null && block instanceof GenericCrafter;
     }
 
-    // 与节能同口径：工厂已启用才生效（被玩家关闭的工厂不超频、不掉血）
+    /**
+     * 生效条件：工厂已启用，<b>且确实在运转</b>（{@code efficiency > 0}）。
+     *
+     * <p><b>为什么必须判「在运转」</b>：超频是「以寿命换产能」——没产能就不该付代价。
+     * 若只判 {@code enabled}，工厂缺料 / 产物堵满时会<b>照常掉血</b>（且 3 档仍按 6 倍功率占用电网），
+     * 玩家看到的是「什么都不产、却一直在损血烧电」。
+     *
+     * <p><b>{@code efficiency} 是引擎给出的权威「本帧是否在运转」信号</b>，覆盖全部停机情形
+     * （已由 {@code Building.updateConsumption()} 字节码确认）：
+     * <ul>
+     *   <li>缺料 → 物品 consumer 的 {@code efficiency()} 返回 0 → 取最小值后 {@code efficiency = 0}；</li>
+     *   <li>产物堵满 → {@code shouldConsume() == false} → 末尾显式把 {@code efficiency} 置 0；</li>
+     *   <li>断电 → {@code potentialEfficiency = 0} → {@code efficiency = 0}；</li>
+     *   <li>被玩家关闭 → 整个分支置 0（{@code enabled} 单独判是为了语义显式）。</li>
+     * </ul>
+     *
+     * <p><b>去抖</b>：{@code efficiency} 会在缺料/来料交替时于 0/1 之间抖动，
+     * 直接拿它当开关会让徽记与倍率每帧闪烁。故不直接返回它，而是要求
+     * <b>{@code warmup}（引擎维护的平滑量，0~1，{@code warmupSpeed = 0.019f}）越过一个下限</b>：
+     * <ul>
+     *   <li>开机/恢复供料 → {@code warmup} 需爬升若干 tick 才越过阈值 → 天然延迟启动，滤掉瞬时抖动；</li>
+     *   <li>停机 → {@code warmup} 平滑衰减（{@code approachDelta(warmup, 0, warmupSpeed)}）→ 效果不会瞬间掉，
+     *       短暂缺料不会立刻撤销。</li>
+     * </ul>
+     * 用引擎自带量而非自建计数器：{@code shouldApply} 被约定为<b>无副作用</b>的纯查询
+     * （见 {@link BuildingBoostSystem.Boost#shouldApply}），且同一目标可能被多台 Provider 各调一次
+     * （多台塔覆盖同一工厂时一 tick 会问多次），自增计数器会重复计数。
+     * {@code warmup} 由引擎每 tick 推进一次、两端一致，天然满足这两条约束。
+     *
+     * <p><b>不会与电网形成震荡环</b>：超频是<b>增加</b>耗电的效果，撤销它只会让电网更宽裕，
+     * 不存在「撤销 → 更缺电 → 撤销更多」的正反馈（省电类效果才有那个方向的风险）。
+     */
     @Override
     public boolean shouldApply(Building target){
-        return target.enabled;
+        if(!target.enabled) return false;
+
+        // 非工厂（理论上 canTarget 已滤掉）退回纯 enabled 判定，避免依赖工厂专有字段
+        if(!(target instanceof GenericCrafter.GenericCrafterBuild crafter)) return true;
+
+        // 必须在运转中，且平滑量已越过阈值：前者保证「不产不付代价」，后者滤掉 0/1 抖动
+        return crafter.efficiency > 0f && crafter.warmup >= warmupThreshold;
     }
 
     @Override
@@ -162,9 +208,18 @@ public class OverclockBoost implements BuildingBoostSystem.Boost, BlockConsumerH
         }
     }
 
+    /**
+     * 撤销：清掉该建筑的掉血计时。
+     *
+     * <p>两个作用：
+     * <ul>
+     *   <li>避免表项随建筑增删无限增长（键是 Building，会钉住世界）；</li>
+     *   <li><b>清掉停机前累计的余量</b>——工厂因缺料/堵料被撤销后，若把计时留着，
+     *       恢复供料时会「立刻」扣一次血（把停机期间的时间也算进去）。清零后从恢复时刻重新计。</li>
+     * </ul>
+     */
     @Override
     public void remove(Building target){
-        // 清理每建筑计时，避免表项随建筑增删无限增长
         damageTimers.remove(target);
     }
 

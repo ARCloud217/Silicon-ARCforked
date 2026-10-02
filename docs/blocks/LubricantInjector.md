@@ -27,6 +27,85 @@
 - `outputsLiquid`: false
 - `liquidCapacity`: 300
 - `alwaysUnlocked`: true
+- `drawCached`: **false**、`drawDynamic`: **true**（自绘三层贴图 + 动态闪光，必须每帧重绘）
+
+## 贴图与绘制
+
+### 四张分层贴图
+
+共 4 张 64×64（即 2x2），置于 `assets/sprites/blocks/lubricant-injector/`：
+
+| 文件 | 字段 | 作用 |
+|------|------|------|
+| `lubricant-injector.png` | `region` | **基准图**：`bottom + top + light` 的合成产物，建造菜单图标；<b>运行期不单独绘制</b> |
+| `-bottom.png` | `bottomRegion` | 底座（纯色打底，全不透明） |
+| `-top.png` | `topRegion` | 顶盖主体（带镂空） |
+| `-light.png` | `lightRegion` | 闪光层，绘制在顶盖**之上** |
+
+- 命名沿用原版液体储罐 `LiquidBlock` 的约定（`{name}-bottom` / `-top`），目录不参与 atlas 键名。
+- 载入在 `load()`：`loadOrFallback(suffix)` 查 `found()`，缺失则回退基准图并 `SiliconLog.warn`
+  （`TextureAtlas.find(String)` 单参版对缺失返回 error 占位图，直接用会糊成缺图且无提示）。
+- **基准图必须存在**：`Block.load()` 里 `region = Core.atlas.find(name)` 用的是**单参版**，
+  对缺失**抛异常**（与分层贴图的双参回退行为不同）。
+
+### 绘制顺序（四层）
+
+```
+① bottomRegion  →  ② 原版液体动画  →  ③ topRegion  →  ④ lightRegion（加色混合，仅工作时）
+```
+
+| 层 | 内容 | 条件 |
+|----|------|------|
+| ① | `bottomRegion` 底座贴图 | 恒绘 |
+| ② | **原版液体动画**：`LiquidBlock.drawTiledFrames(size, x, y, liquidPadding, current, amount/capacity)` | 有油时 |
+| ③ | `topRegion` 顶盖 | 恒绘（**绘制前先 `Draw.color(Color.white)`**） |
+| ④ | `lightRegion` 闪光（`Drawf.additive`） | 工作时 |
+
+- 第 ② 层与原版液体储罐、两用存储器**同一入口**：用引擎 `fluidFrames` 动画帧画出条纹流动的液面，
+  按液体自身颜色着色、以填充比例作 alpha（油多则浓、少则淡）。
+- **画顶盖前必须重置颜色**：`drawTiledFrames` 经 `Drawf.liquid` 着色后会在 `Draw` 上**残留液体颜色**，
+  不重置会把顶盖也染成油色（两用存储器曾专门修过这处，其代码在画顶盖前有 `Draw.color(Color.white)`）。
+- `lubricant-injector.png` 不参与绘制：它是 `bottom + top + light` 的合成产物，故四层画完即得基准图外观
+  （空罐时无第 ② 层，正好等于基准图）。
+
+### 闪光效果（参照原版爆破钻头）
+
+写法参照原版 `BurstDrill`（爆破钻头）的 glow 分支：用 `Drawf.additive` 而非普通绘制——
+加色混合才能得到「发光」观感而非「贴一层颜色」。该辅助方法内部已自行处理
+`Draw.z`、颜色与 `Blending.additive` 的设置与**复位**，故调用方不需要（也不应该）再手动调 `Draw.blend`。
+
+**颜色**：取模组润滑油的配色（`Liquids.lubricant` 的 `8a5a2b` 深琥珀），alpha 压低到 `0.35`——
+`Color.valueOf` 产出不透明色，加色混合下满 alpha 会过曝成白团、盖掉顶盖细节。
+用 `a(0.35f)` 生成新对象而非引用 `Liquids.lubricant.color`，避免「改本方块闪光色」连带改掉全局液体颜色。
+
+**强度**：`Mathf.absin(Time.time, 6f, 1f) * glow`，两个因子相乘——
+
+| 因子 | 作用 |
+|------|------|
+| `glow`（0~1） | 整体开关的平滑缓动（`Mathf.approachDelta`，`glowSpeed = 0.08f`），避免硬切 |
+| `absin(...)` | [0,1] 的正弦脉动，给出持续闪烁的「呼吸」感 |
+
+相乘的好处：未工作时 `glow → 0` 会把脉动一并压到 0，**无需额外分支**判断是否闪烁。
+
+### 闪光与「是否真在工作」严格同步
+
+`glow` 的目标值 `active` 由 `update()` 每帧写入，口径为 **存油 且 至少为一座炮塔提供了强化**：
+
+```java
+active = hasOil && provided > 0;   // provided 与扣油数出自同一遍循环
+```
+
+- `provided` 与**扣油耗**用的是同一个计数（同一次 `targets()` 遍历的两个产物），
+  故闪光与「实际是否在起作用、是否在扣油」严格一致，不会出现「没效果却在闪」或「在扣油却不闪」。
+- 判定条件与 `canTarget`/攻速 Boost 激活口径一致（`isShooting()` + `owns()` + `isProviderOf()`）。
+- `draw()` 只读 `glow`、不做任何扫描，逐帧成本不压在渲染路径上。
+
+### 为何 `drawCached = false`
+
+本方块自绘且带动态闪光。若被烘焙进区块缓存（`drawCached`），`draw()` 只在缓存重建时调用一次，
+工作时不会闪烁；而对齐原版液体方块默认值（`drawCached=false` + `drawDynamic=true`）可保证
+只每帧动态画一次，也不会「进缓存 + 每帧再画」导致半透明叠加过饱和
+（两用存储器曾踩过这个坑，见 `docs/blocks/` 中该方块的说明）。
 
 ## 机制说明
 
@@ -122,3 +201,4 @@ System 内部的登记顺序、目标过滤四层、互斥裁决与清扫流程�
 | a0.x | 性能：boost 列表提为方块级共享只读 Seq（不再每帧 `Seq.with`）；紧贴炮塔列表按 tick 重建并复用同一 Seq，`targets()` 与扣油循环共用（不再每帧新建 + 重扫 proximity） |
 | a0.x | 目标过滤双层化：注入器 `targets()` 前置过滤只交炮塔（非可用对象不进 System 循环）；`Boost.canTarget` 目标过滤 + System 读取执行（`LubricantBoost.canTarget` = 仅炮塔） |
 | a0.x | 提供展示信息（`name()` / `description()` / `visual()` 图标），**强化按钮的绘制、点击与消息输出由 System + `BoostOverlay` 负责**，不计入本方块；效果规格迁至 `docs/boosts/LubricantBoost.md` |
+| a0.x | **分层贴图 + 闪光效果**：改为自绘**四层** `bottom → 原版液体动画 → top → light`（命名与液体层入口沿用原版 `LiquidBlock` 约定），基准图 `lubricant-injector.png` 不再单独绘制（即 `bottom+top+light` 的合成结果，经逐像素验证差异 0 像素）。第②层中 `drawTiledFrames` 会残留液体色，故画顶盖前 `Draw.color(Color.white)` 重置——否则顶盖被染成油色。闪光参照原版爆破钻头 `BurstDrill` 的 glow 分支，用 `Drawf.additive` 加色混合，颜色取润滑油 `8a5a2b`（alpha 压至 0.35 防过曝），强度 = `Mathf.absin(Time.time, 6f, 1f) * glow`，`glow` 由 `Mathf.approachDelta` 平滑缓动。闪光目标状态 `active` 与扣油同一遍循环产出，故与实际工作状态严格同步。新增 `drawCached=false` / `drawDynamic=true` 确保每帧重绘 |

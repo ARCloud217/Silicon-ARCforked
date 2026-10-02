@@ -2,6 +2,7 @@ package silicon.world.blocks.effect;
 
 import arc.Core;
 import arc.graphics.Color;
+import arc.graphics.Colors;
 import arc.graphics.g2d.Draw;
 import arc.graphics.g2d.Fill;
 import arc.graphics.g2d.TextureRegion;
@@ -144,13 +145,28 @@ public class EfficiencyControlTower extends Block{
     }
 
     /**
-     * 范围预览色（随模式）：关闭=淡灰、节能=绿、超频=红。
-     * 供放置预览与选中时共用，保证「看到的颜色」与「当前模式」一致。
+     * 范围预览色（随模式）：关闭 = 淡灰、节能 = 绿、超频 = 红。
+     * 供放置预览、选中区域、配置面板文本三处共用，保证「看到的颜色」与「当前模式」一致。
+     *
+     * <p><b>三色与 bundle 的文本标记严格同源</b>（改动前请先读这段，否则极易改出「文本说绿、画面是黄」）：
+     * <ul>
+     *   <li>关闭 → {@link Color#lightGray}（{@code #bfbfbf}）＝ bundle 的 {@code [lightgray]}；</li>
+     *   <li>节能 → {@link Colors#get(String) Colors.get("green")}（{@code #38d667}，arc 标准绿）
+     *       ＝ bundle 的 {@code [green]}；</li>
+     *   <li>超频 → {@link Pal#remove}（{@code #e55454}）＝ bundle 的 {@code [red]}。</li>
+     * </ul>
+     * 以 {@code Colors.get} 取值而非硬编码十六进制，是为了与 bundle 的 {@code [green]} 取到
+     * <b>同一个</b> {@link Color} 实例——两者同源才不会各自漂移。
+     *
+     * <p><b>为什么不用 {@link Pal#accent}</b>（本方法早期的取值）：它是 {@code #ffd37f},
+     * <b>金黄而非绿</b>，与本方块描述里「节能绿」的文案矛盾（该文案与代码注释都曾误标为绿）。
+     * {@code Pal} 里也没有语义合适的绿：{@code heal} 过浅、{@code regen} 偏白蓝、
+     * {@code shield} 同为金黄。故取 arc 标准绿，使「文本色 == 预览色」成立。
      */
     public static Color modeColor(int mode){
-        if(mode < 0) return Pal.accent;   // 节能：绿
-        if(mode > 0) return Pal.remove;   // 超频：红
-        return Color.lightGray;           // 关闭：淡灰
+        if(mode < 0) return Colors.get("green");   // 节能：绿（同 bundle [green]）
+        if(mode > 0) return Pal.remove;            // 超频：红（同 bundle [red]）
+        return Color.lightGray;                    // 关闭：淡灰（同 bundle [lightgray]）
     }
 
     /** 区域半边长（像素）：range 为奇数时中心恰好落在中间一格上。 */

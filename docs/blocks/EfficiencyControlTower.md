@@ -55,7 +55,7 @@
 | `provides(boost)` | `!conflicted && levelOf(boost) > 0`（档位为 0 即不提供；关闭 → 都不提供） |
 | `levelOf(boost)` | 节能取 `-mode`、超频取 `mode`（夹到 1~3），关闭/越界/冲突为 0 |
 | `Boost.canTarget()` | 耗电 **且** `block instanceof GenericCrafter`（**工厂**：炉/熔炉/压机/粉碎机/合金熔炉等及其子类） |
-| `Boost.shouldApply()` | 目标工厂自身 `enabled`（被关掉的工厂不生效） |
+| `Boost.shouldApply()` | 节能：目标工厂自身 `enabled`（被关掉的工厂不生效）；超频：另有「确实在运转」判定 + 去抖（`enabled && efficiency > 0 && warmup >= warmupThreshold`），见 `docs/boosts/OverclockBoost.md` |
 
 > 「工厂」判定在效果侧，故 `targets()` 只做粗筛（耗电），避免把区域内所有建筑都塞进 System 循环。
 
@@ -160,7 +160,7 @@
 |------|------|
 | **放置时** | `canPlaceOn` 检测到与同队已建成的塔范围重叠 → **拒绝放置**（幽灵变红） |
 | **运行时** | 若仍被放置成功（旧存档、蓝图/命令等绕过路径），该塔**不运行**：`provides()` 恒 false → 不提供任何强化，且原有贡献被 System 撤销 |
-| **视觉** | 范围预览色**随档位**：关闭 = 淡灰（`Color.lightGray`）、节能 = 绿（`Pal.accent`）、超频 = 红（`Pal.remove`）。放置预览恒为淡灰（放置前档位尚不存在，玩家从菜单拿到的永远是默认「关闭」）；选中已建成的塔才显示真实档位色 |
+| **视觉** | 范围预览色**随档位**：关闭 = 淡灰（`Color.lightGray`，`#bfbfbf`）、节能 = 绿（`Colors.get("green")`，`#38d667`）、超频 = 红（`Pal.remove`，`#e55454`）。**三色与 bundle 的文本标记严格同源**（`[lightgray]` / `[green]` / `[red]`），故「描述里说的颜色」与「画面上看到的颜色」一致——节能早期误用 `Pal.accent`（实为金黄 `#ffd37f`），与文案「节能绿」矛盾，已改正。放置预览恒为淡灰（放置前档位尚不存在，玩家从菜单拿到的永远是默认「关闭」）；选中已建成的塔才显示真实档位色 |
 | **范围重叠** | 与同队塔区域重叠（或本身不可放置）时：填充转红 + 经 `drawPlaceText(..., false)` 显示**红色**「范围重叠」（与钻头挖掘速率预览同一入口）。bundle key `block.silicon-efficiency-control-tower.rangeConflict` |
 
 - 判定口径：两塔中心距在**两轴上都小于 `range` 格**即重叠（恰好相切不算重叠）。
@@ -296,4 +296,5 @@ public void draw(){
 | a0.x | **加成文本修正 + 两行合一**：① 根因修复——`BuildingBoostSystem.percentText` 原按「正数 = 节省量」渲染成负号（`v > 0 ? "-"`），导致节能恰好正确而**超频把 `+50%` 印成 `-50%`**；改为**如实加符号**（`v > 0 ? "+"`），两个效果统一传带符号差值 `scale - 1f`（节能为负、超频为正）。② 文案去掉「百分比与标签之间的空格」，与方块描述口径一致。③ 面板由「档位名 + 加成摘要」两行合为**单行** `modeText(mode)` = `{档位名}，{加成摘要}`（如 `1级节能，-20%电力消耗，-15%生产效率`），与强化详情面板 `description()` 的行格式完全一致；`bonusText`/`modeName` 两个方法删除。④ `line` 的 `{0}` 由「档位数字」改为**档位名**（自带「节能/超频」），并移除随之失效的 `block.silicon-efficiency-control-tower.mode.off` |
 | a0.x | **强化消息只显示生效档**：`Boost` 新增带目标的 `name(target)` / `description(target)`（默认委托无参版），多档位效果覆写为「名称+档位」与「仅当前档加成」。`BoostOverlay` 改用这两个重载，故消息为 `2级超频：+100% 生产效率，+125% 电力消耗，-10 生命/秒`，不再罗列三档 |
 | a0.x | 虚线边框改为**不透明**（alpha 固定 1）：`Drawf.dashRect` 只取传入色的 alpha，故显式置 `border.a = 1f`；`drawArea` 去掉 `borderAlpha` 参数。填充仍按模式/冲突着色并保持半透明 |
+| a0.x | **节能预览色由金黄改为绿 + 描述文本语义配色**：`modeColor` 的节能分支原用 `Pal.accent`（实测 `#ffd37f`，<b>金黄而非绿</b>），与代码注释/文档/描述文案里的「节能绿」长期矛盾；改为 `Colors.get("green")`（`#38d667`，arc 标准绿），与 bundle 的 `[green]` **取到同一个 `Color` 实例**（故「文本色 == 预览色」由同源保证，而非两处各写一遍）。三色现与文本标记一一对应：关闭 `Color.lightGray`=`[lightgray]`、节能 `Colors.get("green")`=`[green]`、超频 `Pal.remove`=`[red]`。同时重写中英描述：去掉满屏 `[stat]`，改为**语义配色**（节能段绿、超频段红、关闭淡灰、警示用 `[scarlet]`），并把档位表由「逐项标注」压成「1级：耗电 -20%，生产 -15%」的紧凑格式 |
 | a0.x | **档位贴图**：本体贴图随档位切换，7 张 96×96（关闭=基准图 `efficiency-control-tower.png`、节能 `-L1~-L3`、超频 `-R1~-R3`），载入于 `load()` 的 `modeRegions[]`，取名于 `regionOf(mode)`。绘制采**叠画**：`super.draw()` 画基准图后在 `mode != 0` 时叠画状态图（与 `Switch` 既有约定一致）——成立前提是状态图不透明（七张全 `alpha=255`，合成比对差异 0 像素）。`region` 为共享字段故不可改写，逐建筑取图传入 `Draw.rect`。贴图缺失由 `loadOrFallback` 回退基准图 + `SiliconLog.warn`。`drawCached` 默认 false，故无需 `recache()`，切档立即生效 |
