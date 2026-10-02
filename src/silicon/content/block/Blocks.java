@@ -17,6 +17,7 @@ import silicon.world.blocks.power.GeneratorPump;
 import silicon.world.blocks.power.PowerProtector;
 import silicon.world.blocks.power.RollGenerator;
 import silicon.world.blocks.production.MineConverter;
+import silicon.world.blocks.production.PetroleumRefinery;
 import silicon.world.blocks.sandbox.MessageTest;
 import silicon.world.blocks.sandbox.PowerSource;
 import silicon.world.blocks.satellite.SatelliteConsole;
@@ -32,10 +33,9 @@ import static mindustry.type.ItemStack.with;
 public class Blocks {
     public static Block powerGeneratorPump, dualPurposeJunction, dualPurposeStorager,
             rollGenerator, powerProtector, powerSource, mineConverter, theSwitch, itemTransferHub,
-            dimensionAnchor, signalSource, universalJunction, signalRelay, signalJammer,
-            satelliteLauncher, satelliteConsole, messageTest, signalDetector,
             dimensionAnchor, signalSource, universalJunction, signalRelay, messageTest, petroleumRefinery,
-            lubricantInjector, efficiencyControlTower;
+            lubricantInjector, efficiencyControlTower,
+            signalJammer, satelliteLauncher, satelliteConsole, signalDetector;
 
     public static void load() {
         powerGeneratorPump = new GeneratorPump("power-generator-pump") {{
