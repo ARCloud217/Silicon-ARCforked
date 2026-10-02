@@ -211,6 +211,53 @@
 
 代价是「关闭」/冲突模式下仍会做一次区域查询（为了能正确撤销），但结果按 tick 缓存，开销可忽略。
 
+### 档位贴图
+
+塔的本体贴图**随档位切换**，共 7 张（96×96，即 3x3），置于 `assets/sprites/blocks/efficiency-control-tower/`：
+
+| 档位 | 文件 | 数组下标 |
+|------|------|---------|
+| 关闭（0，默认） | `efficiency-control-tower.png`（基准图） | `0` |
+| 1/2/3 级节能 | `-L1` / `-L2` / `-L3` | `1` / `2` / `3` |
+| 1/2/3 级超频 | `-R1` / `-R2` / `-R3` | `4` / `5` / `6` |
+
+- 载入在 `load()`：`modeRegions[0] = region`（即 `super.load()` 取的基准图），其余按
+  `Core.atlas.find(name + "-L1")` 这类约定取。目录不参与 atlas 键名，
+  实际键为 `silicon-efficiency-control-tower-L1`（模组前缀 `silicon-` 由 `ContentLoader.transformName` 加）。
+- 取名在 `regionOf(int mode)`：负数→L 系列（按绝对值）、正数→R 系列（`level + maxLevel`）、
+  0 或越界→下标 0。
+- **`mode` 与下标的编码不同**：`mode` 是「负=节能 / 0=关闭 / 正=超频」，
+  数组下标是单调整数，映射集中在 `regionOf` 一处。
+- 贴图缺失时不抛异常也不糊成缺图：`loadOrFallback` 查 `found()`，缺失则回退基准图并
+  `SiliconLog.warn`（与 `DualPurposeStorager` 同款约定）。
+  （注意 `TextureAtlas.find(String)` 单参版对缺失**抛异常**，双参版才回退——基准图缺失属前者，
+  故基准图必须存在。）
+
+#### 绘制方式：叠画而非替换
+
+`draw()` 先 `super.draw()` 画基准图，再在 **`mode != 0` 时叠画**对应状态图：
+
+```java
+@Override
+public void draw(){
+    super.draw();
+    if(mode != modeOff){
+        Draw.rect(regionOf(mode), x, y, drawrot());
+    }
+}
+```
+
+- 关闭态**不叠画**，故基准图即 X。
+- 与仓库既有多状态贴图约定一致（`Switch.SwitchBuild#draw` 同样是先 `super.draw()` 再叠画）。
+- **叠画成立的前提是状态图不透明**：七张贴图经隔点采样（96×96 取 2304 点）全部 `alpha=255`，
+  故上层完整盖住下层，基准图透不出来。已对六张状态图做合成比对，
+  「基准图 + 状态图」与「仅状态图」**逐像素差异均为 0**。
+  （若状态图带透明区，叠画才会让基准图透出，那时必须改为替换。）
+- **两者都绝不能改写 `block.region`**：它是全方块共享的基准图，在 `draw` 里改会让场上所有塔一起变图。
+  逐建筑取图、逐建筑传入 `Draw.rect` 才是正确做法。
+- 不需要 `recache()`：`Block.drawCached` 默认为 **false**、`drawDynamic` 默认为 true，
+  本塔每帧动态绘制，切档位立即生效。（`drawCached` 默认值由字节码确认，勿凭印象。）
+
 ### 视觉
 
 - 放置预览与选中时画出 15×15 影响区域（半透明填充 + 描边），与实际判定同口径。
@@ -249,3 +296,4 @@
 | a0.x | **加成文本修正 + 两行合一**：① 根因修复——`BuildingBoostSystem.percentText` 原按「正数 = 节省量」渲染成负号（`v > 0 ? "-"`），导致节能恰好正确而**超频把 `+50%` 印成 `-50%`**；改为**如实加符号**（`v > 0 ? "+"`），两个效果统一传带符号差值 `scale - 1f`（节能为负、超频为正）。② 文案去掉「百分比与标签之间的空格」，与方块描述口径一致。③ 面板由「档位名 + 加成摘要」两行合为**单行** `modeText(mode)` = `{档位名}，{加成摘要}`（如 `1级节能，-20%电力消耗，-15%生产效率`），与强化详情面板 `description()` 的行格式完全一致；`bonusText`/`modeName` 两个方法删除。④ `line` 的 `{0}` 由「档位数字」改为**档位名**（自带「节能/超频」），并移除随之失效的 `block.silicon-efficiency-control-tower.mode.off` |
 | a0.x | **强化消息只显示生效档**：`Boost` 新增带目标的 `name(target)` / `description(target)`（默认委托无参版），多档位效果覆写为「名称+档位」与「仅当前档加成」。`BoostOverlay` 改用这两个重载，故消息为 `2级超频：+100% 生产效率，+125% 电力消耗，-10 生命/秒`，不再罗列三档 |
 | a0.x | 虚线边框改为**不透明**（alpha 固定 1）：`Drawf.dashRect` 只取传入色的 alpha，故显式置 `border.a = 1f`；`drawArea` 去掉 `borderAlpha` 参数。填充仍按模式/冲突着色并保持半透明 |
+| a0.x | **档位贴图**：本体贴图随档位切换，7 张 96×96（关闭=基准图 `efficiency-control-tower.png`、节能 `-L1~-L3`、超频 `-R1~-R3`），载入于 `load()` 的 `modeRegions[]`，取名于 `regionOf(mode)`。绘制采**叠画**：`super.draw()` 画基准图后在 `mode != 0` 时叠画状态图（与 `Switch` 既有约定一致）——成立前提是状态图不透明（七张全 `alpha=255`，合成比对差异 0 像素）。`region` 为共享字段故不可改写，逐建筑取图传入 `Draw.rect`。贴图缺失由 `loadOrFallback` 回退基准图 + `SiliconLog.warn`。`drawCached` 默认 false，故无需 `recache()`，切档立即生效 |

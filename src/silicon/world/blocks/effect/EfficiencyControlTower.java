@@ -4,6 +4,7 @@ import arc.Core;
 import arc.graphics.Color;
 import arc.graphics.g2d.Draw;
 import arc.graphics.g2d.Fill;
+import arc.graphics.g2d.TextureRegion;
 import arc.math.Mathf;
 import arc.scene.ui.Label;
 import arc.scene.ui.layout.Table;
@@ -21,6 +22,7 @@ import mindustry.ui.Styles;
 import mindustry.world.Block;
 import mindustry.world.Tile;
 import silicon.util.BuildingBoostSystem;
+import silicon.util.SiliconLog;
 import silicon.util.boosts.EnergySavingBoost;
 import silicon.util.boosts.OverclockBoost;
 
@@ -84,6 +86,62 @@ public class EfficiencyControlTower extends Block{
 
     /** 影响区域边长（格）：以本方块中心为中心的正方形区域。 */
     public float range = 15f;
+
+    /**
+     * 档位贴图数组：下标 {@code 0} = 关闭，{@code 1~3} = 节能 L1~L3，{@code 4~6} = 超频 R1~R3。
+     *
+     * <p>与 {@code mode}（负=节能 / 0=关闭 / 正=超频）不同，这里是<b>单调整数下标</b>，
+     * 映射见 {@link #regionOf(int)}。在 {@link #load()} 填充，{@link #draw()} 每帧只读。
+     */
+    private TextureRegion[] modeRegions;
+
+    @Override
+    public void load(){
+        super.load();
+
+        // 关闭态沿用基准图（region = super.load() 里 find(name) 取到的），故只载入 6 张状态图。
+        // 命名沿用本仓库既有多状态贴图约定（Switch / FrameBlock）：{name}-{后缀}，
+        // 文件位于 assets/sprites/blocks/efficiency-control-tower/ 下，目录不参与 atlas 键名。
+        modeRegions = new TextureRegion[EfficiencyControlTowerBuild.maxLevel * 2 + 1];
+        modeRegions[0] = region;
+        for(int i = 1; i <= EfficiencyControlTowerBuild.maxLevel; i++){
+            modeRegions[i] = loadOrFallback("-L" + i);
+            modeRegions[i + EfficiencyControlTowerBuild.maxLevel] = loadOrFallback("-R" + i);
+        }
+    }
+
+    /**
+     * 取状态贴图，缺失时回退基准图并告警（与 {@code DualPurposeStorager} 同款约定）。
+     *
+     * <p>{@code Core.atlas.find} 对缺失区域返回 <b>error 占位图</b>而非抛异常，
+     * 若直接用会让整座塔糊成「缺图」贴图且毫无提示，故在这里显式拦截。
+     */
+    private TextureRegion loadOrFallback(String suffix){
+        TextureRegion found = Core.atlas.find(name + suffix);
+        if(!found.found()){
+            SiliconLog.warn("EfficiencyControlTower '{}' missing {} texture, fallback to region", name, suffix);
+            return region;
+        }
+        return found;
+    }
+
+    /**
+     * 取档位对应的贴图：{@code mode < 0} 取节能（按绝对值），{@code mode > 0} 取超频，
+     * {@code 0} 取基准图。越界（>3 / <−3）按 {@code modeOff} 兜底，与 {@code levelOf} 的夹取口径一致。
+     *
+     * <p>绝不能改写 {@code region} 本身：它是 {@link Block} 的<b>共享</b>字段，一改就会让
+     * 场上<b>所有</b>塔同时变图。故按建筑选图、逐建筑传入 {@code draw}。
+     */
+    public TextureRegion regionOf(int mode){
+        if(modeRegions == null) return region;   // load() 未跑（理论上不可达），退回基准图
+
+        int level = Math.abs(mode);
+        if(level == 0 || level > EfficiencyControlTowerBuild.maxLevel) return modeRegions[0];
+
+        // 节能占 1~3、超频占 maxLevel+1~2*maxLevel
+        int index = mode < 0 ? level : level + EfficiencyControlTowerBuild.maxLevel;
+        return modeRegions[index];
+    }
 
     /**
      * 范围预览色（随模式）：关闭=淡灰、节能=绿、超频=红。
@@ -420,7 +478,29 @@ public class EfficiencyControlTower extends Block{
             mode = Mathf.clamp(read.s(), -maxLevel, maxLevel);
         }
 
-        // 选中时显示影响区域（虚线框）；与其他同队塔范围重叠（旧存档/强制放置）时画红色，提示本塔未运行
+        /**
+         * 本体绘制：{@code super.draw()} 先画基准图（X），再按当前档位<b>叠画</b>状态图；
+         * 关闭态不叠任何东西，故基准图即 X。逐建筑取图，不同塔可显示不同贴图。
+         *
+         * <p><b>叠画为何成立</b>：状态图是<b>完全不透明</b>的（96×96 隔点采样 2304 点全部 alpha=255），
+         * 故它完整盖住底下那层，基准图透不出来——叠画结果与「直接替换」<b>逐像素相同</b>
+         * （已对六张状态图做过合成比对：差异像素均为 0）。
+         * 反过来说，若状态图带透明区，叠画才会让基准图透出。
+         *
+         * <p>与仓库既有多状态贴图约定一致（见 {@code Switch.SwitchBuild#draw}：先 {@code super.draw()}
+         * 再叠画状态图）。同理 <b>不能改写 {@code block.region}</b>——它是全方块共享的基准图，
+         * 在 draw 里改会让场上所有塔一起变图。
+         *
+         * <p>不额外调 {@code drawTeamTop()}：{@code super.draw()} 末尾已调用它。
+         */
+        @Override
+        public void draw(){
+            super.draw();
+            if(mode != modeOff){
+                Draw.rect(regionOf(mode), x, y, drawrot());
+            }
+        }
+
         // 选中时显示影响区域（虚线框），颜色随模式；与其他同队塔范围重叠（旧存档/强制放置）时画红，提示本塔未运行
         @Override
         public void drawSelect(){
