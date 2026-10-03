@@ -14,7 +14,7 @@ import static silicon.content.liquid.Liquids.lubricant;
 
 /**
  * 石油炼化厂：2x2 工厂方块。
- * 配方：25 石油 + 50 氢气（每秒，输入液体按 amount×edelta 每 tick 连续扣除）-> 润滑油 10/s + 火石 0.2/s，
+ * 配方：25 石油 + 50 氢气（每秒，输入液体按 amount×edelta 每 tick 连续扣除）-> 润滑油 10/s + 硫 0.2/s，
  * 周期 5s（300 ticks），功耗 240/s。
  *
  * <p>产物行为完全沿用原版 GenericCrafter：craft 时经 offload() 产出（含 produced() 生产统计），
@@ -32,7 +32,7 @@ public class PetroleumRefinery extends GenericCrafter {
     public PetroleumRefinery(String name) {
         super(name);
 
-        // 配方：25 石油/s + 50 氢气/s -> 10 润滑油/s + 0.2 火石/s，周期 5s（300 ticks），功耗 240/s
+        // 配方：25 石油/s + 50 氢气/s -> 10 润滑油/s + 0.2 硫/s，周期 5s（300 ticks），功耗 240/s
         craftTime = 300f;
         // 输入（75/s）与输出（润滑油 10/s）共用同一液体池，容量给足以免输出一堵就触发容量闸门走走停停
         liquidCapacity = 160f;

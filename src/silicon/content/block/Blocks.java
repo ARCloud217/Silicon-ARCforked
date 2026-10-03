@@ -172,7 +172,7 @@ public class Blocks {
             size = 1;
             health = 60;
         }};
-        // 石油炼化厂：2x2 工厂方块。配方：25 石油 + 50 氢气 -> 25 润滑油 + 1 火石（5s/次，240 功率）
+        // 石油炼化厂：2x2 工厂方块。配方（每秒）：25 石油 + 50 氢气 -> 10 润滑油 + 0.2 硫（周期 5s，功耗 240/s）
         petroleumRefinery = new PetroleumRefinery("petroleum-refinery") {{
             requirements(Category.crafting, BuildVisibility.shown,
                     ItemStack.with(Items.copper, 100, Items.lead, 80, Items.graphite, 60, Items.silicon, 60));
