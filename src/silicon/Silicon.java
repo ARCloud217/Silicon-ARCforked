@@ -125,6 +125,14 @@ public class Silicon extends Mod {
             SatelliteManager.onWorldLoaded();          // 步骤 3
             Core.app.post(() -> SatelliteManager.onWorldLoaded(true)); // 步骤 5
             SignalOverlay.reset(); // 清颜色缓存/色相分配/显示状态，防跨世界累积
+            // PowerProtector 无全局静态状态，数据随存档保存，无需重置。
+            // 建筑强化系统的四张状态表以 Building 为键，会把整张旧地图钉在内存里；
+            // 且新图若无强化器则 flushFrame 根本不跑（它由强化器 update() 驱动），
+            // sweepInvalid 也就永不执行，旧建筑会继续被画强化徽记。必须清。
+            // ——只能挂 WorldLoadEvent：挂 PlayerJoin 会让「任何玩家加入」都清空全局强化状态
+            //   （清掉 suppressed = 玩家手动关闭的强化被重新打开；调 onWorldReset() = 超频掉血
+            //   计时归零、惩罚可被joining 反复重置），且客机也会执行（该块不在 net.server() 内）。
+            BuildingBoostSystem.reset();
         });
         // 卫星实体被击落（伤害仅可能来自 scripted unit.damage()）→ 名册除名并广播
         Events.on(EventType.UnitDestroyEvent.class, e -> SatelliteManager.onUnitDestroyed(e.unit));
@@ -138,10 +146,6 @@ public class Silicon extends Mod {
                     Call.tileConfig(e.player, rb, rb.active);
                 }
             }
-            // PowerProtector 无全局静态状态，数据随存档保存，无需重置
-            // 建筑强化系统的四张状态表以 Building 为键，会把整张旧地图钉在内存里；
-            // 且新图若无强化器则 flushFrame 根本不跑，旧建筑会继续被画强化徽记。必须清。
-            BuildingBoostSystem.reset();
         });
 
         BlockSearch.init();

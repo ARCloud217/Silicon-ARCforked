@@ -181,6 +181,19 @@
   - 附带把 `flushedTick` 复位，使新世界第一个 tick 重新触发一次冲洗。
   - 各 `Boost` 自持的静态表经新增的 `Boost#onWorldReset()` 回调清理（默认空实现；如 `OverclockBoost` 的掉血计时表）。
 
+> #### ⚠ `reset()` 只能挂 `WorldLoadEvent`，**绝不能挂 `PlayerJoin`**
+>
+> 曾误挂在 `EventType.PlayerJoin` 上（评审 rt334 复审时发现），后果有三条，且**都不是崩溃级、很难自查**：
+>
+> 1. **任何玩家加入都会清空全局强化状态**——包括 `suppressed`（玩家手动关闭的强化被重新打开）、
+>    以及已稳定生效的注入式累积（`reloadCounter` 进度、进度条等）。
+> 2. **`onWorldReset()` 被反复触发** ⇒ 超频的掉血计时归零 ⇒ **惩罚可被joining 反复重置**（人人可刷）。
+> 3. **客机也会执行**：该调用原先落在 `if (net.server())` **之外**，于是两端在「玩家加入」这一帧
+>    各自清表，而加入事件的触发时机/次数并不保证两端一致 ⇒ **纯粹的本地模拟量也可能被清出不同结果**。
+>
+> 反过来说，`reset()` 是**跨世界**清理，不该由任何「会话内事件」触发——它只回答一个问题：
+> 「上一张地图的状态还该不该留着」。答案只在新图/读档时才是「否」。
+
 ## 性能与资源约定
 
 | 点 | 做法 |
@@ -244,7 +257,7 @@
 | `levelIndex(level, length)` | 档位（自 1 起）→ 倍率表下标，越界夹到最近合法档。**仅在 `length >= 1` 时保证返回值合法** |
 | `levelValue(table, level)` | 按档位取倍率表的值，等价 `table[levelIndex(level, table.length)]`，但**表为空时回落 `1f`（不改变任何量）**而不抛越界。倍率表是各效果上的 public 可变字段，被别的 mod 置空时不应让游戏崩在这种地方——**倍率表一律走本方法，不要用 `levelIndex` 的下标去索引另一张表**（长度不一致即 AIOOBE） |
 | `percentText(ratio)` | 倍率差 → 百分比文本，**符号与数值一致**（`0.5f` → `"+50%"`，`-0.2f` → `"-20%"`）。**调用方须传带符号差值 `scale - 1f`**：节能为负、超频为正。本方法只加符号、**不反转** |
-| `reset()` | **换图/读档清空全部状态表**（已挂 `WorldLoadEvent`）。必须清的理由见「生命周期兜底」——`isValid()` 放行旧世界建筑，清扫兜不住 |
+| `reset()` | **换图/读档清空全部状态表**（已挂 `WorldLoadEvent`，**不得挂 `PlayerJoin` 等会话内事件**）。必须清的理由见「生命周期兜底」——`isValid()` 放行旧世界建筑，清扫兜不住 |
 | `activeBoosts(target)` | 查目标当前生效的**效果单元列表**（`Seq<Boost>`，每次新建，**仅供点击/开面板等低频路径**，勿放每帧循环） |
 | `hasActiveBoosts(target)` | 目标是否还有生效强化（零分配，供每帧轮询） |
 | `isActive(target, boostId)` | 指定效果当前是否生效（零分配 O(1)）。**供「引擎钩子」在被引擎回调时查询自身倍率**——钩子不能缓存每建筑状态（缓存会产生两端不同步窗口） |
@@ -373,3 +386,4 @@ System 撤销某个 Provider 贡献的**唯一**路径是：该 Provider 仍被 
 > **为什么不用 TAB（U+0009）**：tab 在 `GlyphLayout` 里落到 `default` 分支被当普通字形，既**不产生断行约束**（换行位置纯由像素宽度决定），其**本身还会占一个字形宽度**（位图字体无 tab 字形），反而更容易把冒号挤下去。 |
 | a0.x | **自检修复**（多人/健壮性）：① `levelOf` 多提供者裁决键由「建筑 `id` 最小」改为「`(tileX, tileY)` 字典序最小」，移除对 `EntityGroup.nextId()` 本地分配这一未验证量的依赖（详见「档位裁决为什么不用建筑 id」）；② `BoostOverlay.checkInput` 命中失效条目时由 `return` 改为 `continue`——原先一个恰好盖住光标的失效条目会吞掉整次点击，导致其后真正命中的徽记点不到（徽记密集时尤其明显）；③ `EfficiencyControlTower.drawPlace` 补 `Vars.player == null` 保护（无头/专服渲染时 `Vars.player.team()` 会 NPE），此时退回按「可放置」显示、不做重叠判定；④ `BoostOverlay.postBoostInfo` 补 `target.block == null` 保护；⑤ 新增 `levelValue(table, level)` 并让两个效果的 `FactorSource` 走它——倍率表被置空时回落 `1f` 而非抛数组越界，`OverclockBoost.apply` 的提速/掉血同样加空表保护（空表 = 既不提速也不掉血） |
 | a0.x | **采纳外部评审（rt334，实现层）**共 8 条、驳回 1 条：①【阻塞·已修】`reconcile` 的 apply 分支无条件调用，而它有**两个**调用点、只有 `flushFrame` 带 `flushedTick` 守卫：拆强化器 → `onRemoved` → `removeProviderContributions` → 同 tick 对「仍有其他提供者」的效果**再 apply 一次**，注入式效果双倍（转角两格/充能两份/多记一次掉血），且拆了又放回可反复触发＝可刷产量。改为 `reconcile(target, tmap, allowApply)`，`flushFrame` 传 `true`、即时重算路径传 `false`；②【高·已修】四张状态表以 `Building` 为键且全类**无任何 `Events.on`**——`Building → Tile → World` 强引用链会把整张旧地图钉在内存，且 `isValid()`（`tile != null && tile.build == this && !dead()`）**放行旧世界建筑**，新图无强化器时 `flushFrame` 不跑 ⇒ `sweepInvalid` 也不跑 ⇒ 旧建筑继续被画徽记。新增 `reset()` 并挂 `EventType.WorldLoadEvent`（`Silicon.java`），含 `flushedTick` 复位与新增的 `Boost#onWorldReset()` 回调（`OverclockBoost` 覆写以清掉血计时表）；③【中·已修】`sweepInvalid` 每 tick `new ObjectSet`/`new Seq` 改为静态复用 `badTargets`/`badProviders`；④【中·已修·修正建议写法】`BoostOverlay.checkInput` 缺 UI 焦点判定：本钩子跑在输入阶段、**早于 Scene 消费点击**，故在建造菜单/消息面板上点到光标下徽记仍会投递消息。补 `Core.scene.hasMouse()`——**不能用评审建议的 `hasMouse(wx, wy)`**：该重载走 `Scene.hit(x,y)`，要求**控件局部坐标**，传世界坐标无意义（无参版才是 `getHoverElement() != null`）；⑤【中·已修】`LubricantBoost` 攻速注入条件比引擎 `handleReload` 宽：引擎是 `if(!reloadWhileCharging && charging()) return; if(reloadCounter >= reload) return;`，而本注入只看 `isShooting()`——**已充满**的炮塔每 tick 仍被注入，而 `updateShooting` 减去 `reload` 后**保留溢出**，溢出累积成「补弹瞬间连发」的蓄力 bursts，实际收益远超文案 `+20%`；充能中的炮塔也会被推进。新增 `canEngineReload()` 逐条镜像引擎守卫；⑥【低·已修】`summary()` 用「一张表算出的下标索引另一张表」（三张 public 可变表长度不一致即 AIOOBE），改为逐表走 `levelValue`；⑦【低·已修】`Provider.boosts()` 缺 null 判（`targets()` 有），第三方返回 null 会 NPE；⑧【低·已修】`removeBuilding` 是唯一「边遍历 `map.keys()` 边回调第三方 `boost.remove()`」的路径，改走 `idBuffer` 先收集。**驳回**：`Hit.target` 从不置空 alleged 泄漏——`hits.clear()` 每帧执行，引用当帧即释放，且有 `isValid()` 兜底，非缺陷 |
+| a0.x | **采纳 PR #74 复审（rt334）2 条仓库级问题**：① `BuildingBoostSystem.reset()` 误挂在 `EventType.PlayerJoin`（而非文档所写的 `WorldLoadEvent`），已移回 `WorldLoadEvent`。挂 `PlayerJoin` 会让**任何玩家加入**都清空全局强化状态（`suppressed` 被清⇒玩家手动关闭的强化重新打开）、反复触发 `onWorldReset()`（超频掉血计时归零⇒**惩罚可刷**），且该调用原在 `if (net.server())` **之外**、**客机也执行**⇒两端清表时机不一致。② 删除 bundle 里的孤儿 key `item.silicon-thulium.*`（铥）及其空的「物品」分区：该物品在 `src/` 与 `test` 分支均无任何定义/引用（仅 6 行 bundle，自带 `(Deprecated)` 标记），给不存在的物品留 key 不产生任何效果，也救不了旧存档 |
